@@ -63,6 +63,22 @@ class ProjectionService:
     def update(self, projection_id: str, **data) -> Optional[Projection]:
         return projection_store.update(projection_id, **data)
 
+    def claim(self, projection_id: str, status: str, **data) -> bool:
+        """Atomically move a non-busy projection to ``status``; False if busy."""
+        return projection_store.claim(projection_id, status, **data)
+
+    def delete_if_idle(self, projection_id: str) -> bool:
+        """Delete a projection and its queries only if idle with no graph attached.
+
+        Returns False (and deletes nothing) if the projection is busy, still has
+        a graph, or does not exist.
+        """
+        with connection() as conn:
+            if not projection_store.delete_if_idle_on(conn, projection_id):
+                return False
+            query_store.delete_node_and_edge_queries_on(conn, projection_id)
+            return True
+
     def delete(self, projection_id: str) -> bool:
         """Delete a projection and its associated node/edge queries atomically.
 

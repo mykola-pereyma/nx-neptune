@@ -1,16 +1,17 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from botocore.exceptions import ClientError
 from httpx import ASGITransport, AsyncClient
 
 from nx_neptune_proxy.app import app
 from nx_neptune_proxy.auth import get_token
 from nx_neptune_proxy.services.db import connection
 from nx_neptune_proxy.services.project_store import store as project_store
-from nx_neptune_proxy.services.projection_store import store
+from nx_neptune_proxy.services.projection_store import BUSY_STATUSES as BUSY, store
 
 
 @pytest.fixture
@@ -242,13 +243,187 @@ async def test_execute_returns_202(client):
 
 
 @pytest.mark.asyncio
-async def test_execute_conflict_if_already_running(client):
+@pytest.mark.parametrize("busy", ["importing", "deleting"])
+async def test_execute_while_busy_returns_409_and_does_not_schedule(client, busy):
     create_resp = await client.post("/api/v0/projection", json=SAMPLE_BODY())
     pid = create_resp.json()["id"]
-    store.update(pid, status="executing")
+    store.update(pid, status=busy)
 
-    resp = await client.post(f"/api/v0/projection/{pid}/execute")
+    with patch("nx_neptune_proxy.routers.projection.run_pipeline") as run:
+        resp = await client.post(f"/api/v0/projection/{pid}/execute")
     assert resp.status_code == 409
+    run.assert_not_called()
+    assert store.get(pid).status == busy
+
+
+@pytest.mark.asyncio
+async def test_execute_twice_second_returns_409(client):
+    """Execute claims the projection before scheduling, so a second call loses."""
+    create_resp = await client.post("/api/v0/projection", json=SAMPLE_BODY())
+    pid = create_resp.json()["id"]
+
+    with patch("nx_neptune_proxy.routers.projection.run_pipeline") as run:
+        first = await client.post(f"/api/v0/projection/{pid}/execute")
+        second = await client.post(f"/api/v0/projection/{pid}/execute")
+    assert first.status_code == 202
+    assert second.status_code == 409
+    assert run.call_count == 1
+    assert store.get(pid).status == "importing"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["complete", "failed", "archived"])
+async def test_execute_from_idle_status_returns_202(client, status):
+    create_resp = await client.post("/api/v0/projection", json=SAMPLE_BODY())
+    pid = create_resp.json()["id"]
+    store.update(pid, status=status)
+
+    with patch("nx_neptune_proxy.routers.projection.run_pipeline"):
+        resp = await client.post(f"/api/v0/projection/{pid}/execute")
+    assert resp.status_code == 202
+
+
+def test_claim_is_compare_and_set():
+    p = store.create(project_id=_TEST_PROJECT_ID)
+    assert store.claim(p.id, "importing") is True
+    assert store.claim(p.id, "importing") is False
+    assert store.claim(p.id, "deleting") is False
+    store.update(p.id, status="failed")
+    assert store.claim(p.id, "deleting", step="graph_delete") is True
+    assert store.get(p.id).step == "graph_delete"
+
+
+@pytest.mark.asyncio
+async def test_startup_fails_interrupted_projections_so_they_can_retry(client):
+    from nx_neptune_proxy.app import resume_pending_deletions
+
+    busy = {s: store.create(project_id=_TEST_PROJECT_ID) for s in BUSY}
+    for status, p in busy.items():
+        store.update(p.id, status=status, graph_id="g-123")
+    idle = store.create(project_id=_TEST_PROJECT_ID)
+
+    await resume_pending_deletions()
+
+    for p in busy.values():
+        after = store.get(p.id)
+        assert after.status == "failed"
+        assert after.graph_id == "g-123"
+        assert after.error
+    assert store.get(idle.id).status == "draft"
+    with patch("nx_neptune_proxy.routers.projection.run_pipeline"):
+        resp = await client.post(f"/api/v0/projection/{busy['importing'].id}/execute")
+    assert resp.status_code == 202
+
+
+def test_claim_missing_projection_returns_false():
+    assert store.claim("does-not-exist", "importing") is False
+
+
+def test_claim_rejects_unknown_column():
+    p = store.create(project_id=_TEST_PROJECT_ID)
+    with pytest.raises(ValueError):
+        store.claim(p.id, "importing", bogus=1)
+
+
+# --- Delete graph ---
+
+
+@pytest.fixture
+def graph_aws():
+    """Patch the AWS calls made by delete-graph; yields the Neptune client mock."""
+    neptune = MagicMock()
+    neptune.get_graph.side_effect = ClientError(
+        {"Error": {"Code": "ResourceNotFoundException"}}, "GetGraph"
+    )
+    factory = MagicMock()
+    factory.return_value.neptune.return_value = neptune
+    no_sleep = MagicMock()
+    no_sleep.sleep = AsyncMock()
+    with (
+        patch("nx_neptune_proxy.routers.projection.ClientFactory", factory),
+        patch(
+            "nx_neptune_proxy.routers.projection.get_graph_or_exception",
+            return_value={"name": "nx-neptune-test"},
+        ),
+        patch("nx_neptune_proxy.routers.projection.assert_managed_graph"),
+        patch("nx_neptune_proxy.routers.projection.asyncio", no_sleep),
+    ):
+        yield neptune
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("busy", ["importing", "deleting"])
+async def test_delete_graph_while_busy_returns_409(client, graph_aws, busy):
+    create_resp = await client.post("/api/v0/projection", json=SAMPLE_BODY())
+    pid = create_resp.json()["id"]
+    store.update(pid, status=busy, graph_id="g-123")
+
+    resp = await client.post(f"/api/v0/projection/{pid}/delete-graph")
+    assert resp.status_code == 409
+    graph_aws.delete_graph.assert_not_called()
+    after = store.get(pid)
+    assert after.status == busy
+    assert after.graph_id == "g-123"
+
+
+@pytest.mark.asyncio
+async def test_delete_graph_when_idle_archives_projection(client, graph_aws):
+    create_resp = await client.post("/api/v0/projection", json=SAMPLE_BODY())
+    pid = create_resp.json()["id"]
+    store.update(pid, status="complete", graph_id="g-123")
+
+    resp = await client.post(f"/api/v0/projection/{pid}/delete-graph")
+    assert resp.status_code == 202
+    graph_aws.delete_graph.assert_called_once_with(
+        graphIdentifier="g-123", skipSnapshot=True
+    )
+    after = store.get(pid)
+    assert after.status == "archived"
+    assert after.graph_id is None
+
+
+# --- Purge ---
+
+
+@pytest.mark.asyncio
+async def test_purge_with_graph_attached_returns_409(client):
+    create_resp = await client.post("/api/v0/projection", json=SAMPLE_BODY())
+    pid = create_resp.json()["id"]
+    store.update(pid, status="complete", graph_id="g-123")
+
+    resp = await client.delete(f"/api/v0/projection/{pid}")
+    assert resp.status_code == 409
+    assert store.get(pid) is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("busy", ["importing", "deleting"])
+async def test_purge_while_busy_returns_409(client, busy):
+    create_resp = await client.post("/api/v0/projection", json=SAMPLE_BODY())
+    pid = create_resp.json()["id"]
+    store.update(pid, status=busy)
+
+    resp = await client.delete(f"/api/v0/projection/{pid}")
+    assert resp.status_code == 409
+    assert store.get(pid) is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["draft", "archived", "failed"])
+async def test_purge_idle_without_graph_returns_200(client, status):
+    create_resp = await client.post("/api/v0/projection", json=SAMPLE_BODY())
+    pid = create_resp.json()["id"]
+    store.update(pid, status=status)
+
+    resp = await client.delete(f"/api/v0/projection/{pid}")
+    assert resp.status_code == 200
+    assert store.get(pid) is None
+
+
+@pytest.mark.asyncio
+async def test_purge_missing_returns_404(client):
+    resp = await client.delete("/api/v0/projection/does-not-exist")
+    assert resp.status_code == 404
 
 
 # --- List projections ---
@@ -287,10 +462,10 @@ async def test_execute_poll_lifecycle(client):
         resp = await client.post(f"/api/v0/projection/{pid}/execute")
     assert resp.status_code == 202
 
-    # Status should be executing (set by background task, but we simulate)
-    store.update(pid, status="executing", progress=50)
+    # Execute claims the projection as importing before scheduling the pipeline
+    store.update(pid, progress=50)
     resp = await client.get(f"/api/v0/projection/{pid}/status")
-    assert resp.json()["status"] == "executing"
+    assert resp.json()["status"] == "importing"
     assert resp.json()["progress"] == 50
 
     # Simulate completion
