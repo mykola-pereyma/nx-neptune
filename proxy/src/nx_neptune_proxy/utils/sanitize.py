@@ -9,6 +9,8 @@ import re
 _SENSITIVE_PATTERNS = [
     (re.compile(r"arn:aws[^:\s]*:[^:\s]*:[^:\s]*:\d{12}:[^\s,\"']+"), "[ARN]"),
     (re.compile(r"(AKIA|ASIA|AROA|AIDA)[0-9A-Z]{16}"), "[AWS_ID]"),
+    # Bare account IDs; runs after the ARN pattern so ARNs collapse to [ARN] first
+    (re.compile(r"\b\d{12}\b"), "[ACCOUNT_ID]"),
 ]
 
 
