@@ -131,43 +131,314 @@ make lock
 Before using this backend, ensure the following prerequisites are met:
 
 ### AWS IAM Permissions
-The IAM role or user accessing Neptune Analytics must have the following permissions:
+The IAM role or user you run nx-neptune as needs the permissions below. Grant
+only the groups for the features you use. A complete
+[least-privilege policy](#example-least-privilege-policy) follows the lists.
 
-These permissions are required to read, write, and manage graph data via queries on Neptune Analytics:
+#### Graph query operations
+
+Required to read, write, and manage graph data via queries on Neptune Analytics:
 
   - `neptune-graph:ReadDataViaQuery`
   - `neptune-graph:WriteDataViaQuery`
   - `neptune-graph:DeleteDataViaQuery`
 
-These permissions are required to start/stop a Neptune Analytics graph:
+#### Graph creation and deletion
+
+Required when nx-neptune creates or deletes a graph for you (`SessionManager`,
+the instance-management APIs, or the proxy):
+
+  - `neptune-graph:CreateGraph` (and `neptune-graph:CreateGraphUsingImportTask` to create a graph from S3)
+  - `neptune-graph:TagResource` (every graph nx-neptune creates is tagged)
+  - `neptune-graph:DeleteGraph` (for delete)
+  - `neptune-graph:UpdateGraph` (turns deletion protection off before a delete)
+  - `neptune-graph:GetGraph` and `neptune-graph:ListGraphs` (graph lookup and status polling)
+
+> **`Resource: "*"` is currently required for these actions.** The permission
+> preflight simulates `CreateGraph`, `TagResource`, `DeleteGraph`, `StartGraph`,
+> `StopGraph`, the snapshot actions, `athena:StartQueryExecution` and
+> `athena:GetQueryExecution` against `"*"`. A statement scoped to graph or
+> workgroup ARNs is reported as `Insufficient permission`, even though IAM
+> would allow the real call. Grant those actions on `Resource: "*"` until upstream
+> issue 576 is fixed. The query actions are not simulated and can stay scoped to
+> your graphs.
+
+#### Graph start/stop
+
+Required to start/stop a Neptune Analytics graph:
 
   - `neptune-graph:StartGraph`
   - `neptune-graph:StopGraph`
 
-These permissions are required to save/restore a Neptune Analytics snapshot:
+#### Snapshots
+
+Required to save/restore a Neptune Analytics snapshot:
 
   - `neptune-graph:CreateGraphSnapshot` (for save)
   - `neptune-graph:RestoreGraphFromSnapshot` (for restore)
   - `neptune-graph:DeleteGraphSnapshot` (for delete)
+  - `neptune-graph:GetGraphSnapshot` (status polling)
   - `neptune-graph:TagResource`
 
-These permissions are required to import/export between S3 and Neptune Analytics:
+#### S3 import/export
 
+Required to import/export between S3 and Neptune Analytics:
+
+  - `neptune-graph:StartImportTask` and `neptune-graph:GetImportTask` (for import)
+  - `neptune-graph:StartExportTask` and `neptune-graph:GetExportTask` (for export)
   - `s3:GetObject` (for import)
   - `s3:PutObject` (for export)
   - `s3:ListBucket` (for export)
-  - `s3:DeleteBucket` (for delete)
+  - `s3:DeleteObject` (for export and delete)
+  - `s3:GetBucketVersioning` (see [S3 bucket versioning](#s3-bucket-versioning))
   - `kms:Decrypt`
   - `kms:GenerateDataKey`
   - `kms:DescribeKey`
+  - `iam:GetRole` and `iam:PassRole` (see [IAM permission preflight](#iam-permission-preflight) and [Import/export role](#importexport-role))
 
-In Addition to the S3 import/export permissions, to read from/write to an existing S3 Tables datalake: 
+#### Data lake (Athena and Glue)
+
+In addition to the S3 permissions above, reading from or writing to a data lake
+(S3 Tables or the AWS Glue Data Catalog) through Athena needs:
 
   - `athena:StartQueryExecution`
   - `athena:GetQueryExecution`
-  - `athena:GetTableMetadata` and `glue:GetTable` (for `import_from_graph_schema`, which reads source table columns)
+  - `athena:GetQueryResults`
+  - `athena:GetTableMetadata` (for `import_from_graph_schema`, which reads source table columns)
+  - `athena:GetDatabase` (resource validation)
+  - `glue:GetDatabase` and `glue:GetDatabases`
+  - `glue:GetTable` and `glue:GetTables`
 
-The ARN with the above permissions must be added to your environment variables
+Athena also needs `s3:GetBucketLocation`, `s3:GetObject`, `s3:PutObject` and
+`s3:ListBucket` on its query-results location. To browse catalogs in the proxy
+UI, also grant `athena:ListDataCatalogs`, `athena:ListDatabases` and
+`athena:ListTableMetadata`. Grant `athena:StartQueryExecution` and
+`athena:GetQueryExecution` on `Resource: "*"` for now; see the note under
+[Graph creation and deletion](#graph-creation-and-deletion).
+
+**Lake Formation.** If your account uses AWS Lake Formation to enforce Data
+Catalog permissions, IAM permissions alone are not enough. Grant the role
+`lakeformation:GetDataAccess` in IAM, and in Lake Formation:
+
+  - `DESCRIBE` on each database you read from
+  - `SELECT` and `DESCRIBE` on each table you read from
+
+Without these grants, the databases and tables the role cannot see are
+**silently left out** of listings instead of being reported as an access error.
+
+#### IAM permission preflight
+
+Before an import, export or Athena operation, nx-neptune checks the role's
+permissions so it can fail early with a clear message:
+
+  - `iam:GetRole` is **required** for S3 import, export and delete. nx-neptune
+    reads the role's trust policy to confirm that Neptune Analytics can assume
+    the role. Without this permission the operation fails.
+  - `iam:SimulatePrincipalPolicy` is **optional**. nx-neptune uses it to
+    simulate the actions listed above. Without it the simulation is skipped
+    with a warning, and a missing permission surfaces later as an
+    `AccessDenied` from the real call. When the simulation runs, the
+    `Resource: "*"` note above applies.
+
+You can run the checks on demand with `instance_management.validate_permissions()`.
+
+#### Import/export role
+
+nx-neptune passes the identity you run as (from `sts:GetCallerIdentity`) to
+Neptune Analytics as the role for S3 import and export tasks. That role
+therefore also needs:
+
+1. A **trust policy** that lets `neptune-graph.amazonaws.com` assume it. Keep
+   the `aws:SourceAccount` and `aws:SourceArn` conditions: they stop a Neptune
+   Analytics graph in another account from using your role (the
+   [confused deputy problem](https://docs.aws.amazon.com/IAM/latest/UserGuide/confused-deputy.html)).
+2. `iam:PassRole` **on itself**, limited with the condition
+   `iam:PassedToService` = `neptune-graph.amazonaws.com`.
+
+> **Known issue:** some import paths are not yet compatible with every form of
+> these conditions. If an import fails with an assume-role error, widen
+> `aws:SourceArn` to every Neptune Analytics resource in your account
+> (`arn:aws:neptune-graph:REGION:ACCOUNT_ID:*`, as below). Do not remove the
+> conditions or trust the service principal unconditionally.
+
+Example trust policy statement. Replace `REGION` and `ACCOUNT_ID`, and keep the
+existing statements that let your users, EC2 or SageMaker assume the role:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowNeptuneAnalyticsImportExport",
+      "Effect": "Allow",
+      "Principal": { "Service": "neptune-graph.amazonaws.com" },
+      "Action": "sts:AssumeRole",
+      "Condition": {
+        "StringEquals": { "aws:SourceAccount": "ACCOUNT_ID" },
+        "ArnLike": { "aws:SourceArn": "arn:aws:neptune-graph:REGION:ACCOUNT_ID:*" }
+      }
+    }
+  ]
+}
+```
+
+#### S3 bucket versioning
+
+Every S3 bucket that nx-neptune writes to or deletes from (export, Athena query
+results, staging) **must have versioning enabled**, so that an overwrite or a
+delete can be recovered. nx-neptune checks this with `s3:GetBucketVersioning`
+and refuses the operation if versioning is off. Enable it with:
+
+```bash
+aws s3api put-bucket-versioning --bucket BUCKET \
+  --versioning-configuration Status=Enabled
+```
+
+Versioning keeps every overwritten and deleted object. Add a lifecycle rule that
+expires noncurrent versions to keep storage costs bounded, for example after 30
+days:
+
+```bash
+aws s3api put-bucket-lifecycle-configuration --bucket BUCKET \
+  --lifecycle-configuration '{"Rules":[{"ID":"expire-noncurrent-versions","Status":"Enabled","Filter":{},"NoncurrentVersionExpiration":{"NoncurrentDays":30},"AbortIncompleteMultipartUpload":{"DaysAfterInitiation":7}}]}'
+```
+
+#### Example least-privilege policy
+
+An identity policy for the role that covers every feature above. Replace
+`REGION`, `ACCOUNT_ID`, `ROLE_NAME`, `BUCKET` and `KEY_ID`, and drop the
+statements for features you do not use. If the Athena workgroup you use is not
+`primary`, change the workgroup ARN.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "NeptuneGraphData",
+      "Effect": "Allow",
+      "Action": [
+        "neptune-graph:ReadDataViaQuery",
+        "neptune-graph:WriteDataViaQuery",
+        "neptune-graph:DeleteDataViaQuery",
+        "neptune-graph:GetGraph",
+        "neptune-graph:GetGraphSummary",
+        "neptune-graph:ResetGraph",
+        "neptune-graph:StartImportTask",
+        "neptune-graph:StartExportTask"
+      ],
+      "Resource": "arn:aws:neptune-graph:REGION:ACCOUNT_ID:graph/*"
+    },
+    {
+      "Sid": "NeptuneGraphLifecycleResourceStarUntilPreflightFix",
+      "Effect": "Allow",
+      "Action": [
+        "neptune-graph:CreateGraph",
+        "neptune-graph:CreateGraphUsingImportTask",
+        "neptune-graph:TagResource",
+        "neptune-graph:UpdateGraph",
+        "neptune-graph:DeleteGraph",
+        "neptune-graph:StartGraph",
+        "neptune-graph:StopGraph",
+        "neptune-graph:ListGraphs",
+        "neptune-graph:GetImportTask",
+        "neptune-graph:GetExportTask",
+        "neptune-graph:CreateGraphSnapshot",
+        "neptune-graph:GetGraphSnapshot",
+        "neptune-graph:RestoreGraphFromSnapshot",
+        "neptune-graph:DeleteGraphSnapshot"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "PassOwnRoleToNeptuneAnalytics",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::ACCOUNT_ID:role/ROLE_NAME",
+      "Condition": {
+        "StringEquals": { "iam:PassedToService": "neptune-graph.amazonaws.com" }
+      }
+    },
+    {
+      "Sid": "PermissionPreflight",
+      "Effect": "Allow",
+      "Action": ["iam:GetRole", "iam:SimulatePrincipalPolicy"],
+      "Resource": "arn:aws:iam::ACCOUNT_ID:role/ROLE_NAME"
+    },
+    {
+      "Sid": "S3Bucket",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket",
+        "s3:GetBucketLocation",
+        "s3:GetBucketVersioning",
+        "s3:GetEncryptionConfiguration"
+      ],
+      "Resource": "arn:aws:s3:::BUCKET"
+    },
+    {
+      "Sid": "S3Objects",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::BUCKET/*"
+    },
+    {
+      "Sid": "KmsForBucket",
+      "Effect": "Allow",
+      "Action": ["kms:Decrypt", "kms:GenerateDataKey", "kms:DescribeKey"],
+      "Resource": "arn:aws:kms:REGION:ACCOUNT_ID:key/KEY_ID"
+    },
+    {
+      "Sid": "AthenaQueries",
+      "Effect": "Allow",
+      "Action": [
+        "athena:GetQueryResults",
+        "athena:GetTableMetadata",
+        "athena:GetDatabase",
+        "athena:ListDatabases",
+        "athena:ListTableMetadata"
+      ],
+      "Resource": [
+        "arn:aws:athena:REGION:ACCOUNT_ID:workgroup/primary",
+        "arn:aws:athena:REGION:ACCOUNT_ID:datacatalog/*"
+      ]
+    },
+    {
+      "Sid": "AthenaResourceStarUntilPreflightFix",
+      "Effect": "Allow",
+      "Action": [
+        "athena:StartQueryExecution",
+        "athena:GetQueryExecution",
+        "athena:ListDataCatalogs"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "GlueDataCatalog",
+      "Effect": "Allow",
+      "Action": [
+        "glue:GetDatabase",
+        "glue:GetDatabases",
+        "glue:GetTable",
+        "glue:GetTables"
+      ],
+      "Resource": [
+        "arn:aws:glue:REGION:ACCOUNT_ID:catalog",
+        "arn:aws:glue:REGION:ACCOUNT_ID:catalog/*",
+        "arn:aws:glue:REGION:ACCOUNT_ID:database/*",
+        "arn:aws:glue:REGION:ACCOUNT_ID:table/*/*"
+      ]
+    }
+  ]
+}
+```
+
+With `iam:SimulatePrincipalPolicy` granted, the preflight also simulates S3
+bucket and object actions against a single ARN (upstream issue 576). If it
+reports `Insufficient permission` for an S3 action that this policy grants,
+either remove `iam:SimulatePrincipalPolicy` (the checks are skipped with a
+warning, and IAM still enforces every real call), or grant the `S3Bucket` and
+`S3Objects` actions on both `arn:aws:s3:::BUCKET` and `arn:aws:s3:::BUCKET/*`.
 
 ### Python Runtime
 
