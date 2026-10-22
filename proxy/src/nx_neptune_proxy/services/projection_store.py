@@ -10,6 +10,18 @@ from typing import List, Optional
 
 from .db import connection
 
+# Projection lifecycle statuses, shared by the routers and the pipeline.
+STATUS_DRAFT = "draft"
+STATUS_IMPORTING = "importing"
+STATUS_COMPLETE = "complete"
+STATUS_FAILED = "failed"
+STATUS_DELETING = "deleting"
+STATUS_ARCHIVED = "archived"
+
+# A background task owns the projection (and its graph) while in one of these.
+BUSY_STATUSES = (STATUS_IMPORTING, STATUS_DELETING)
+_NOT_BUSY = f"status NOT IN ({', '.join('?' for _ in BUSY_STATUSES)})"
+
 _FIELDS = [
     "id",
     "status",
@@ -71,7 +83,7 @@ class ProjectionStore:
     ) -> Projection:
         p = Projection(
             id=str(uuid.uuid4()),
-            status="draft",
+            status=STATUS_DRAFT,
             catalog=catalog,
             database=database,
             node_query=node_query,
@@ -145,6 +157,38 @@ class ProjectionStore:
             conn.execute(f"UPDATE projections SET {sets} WHERE id = ?", vals)
         return self.get(projection_id)
 
+    def claim(self, projection_id: str, status: str, **kwargs) -> bool:
+        """Atomically set ``status`` (and ``kwargs``) unless the projection is busy.
+
+        A single conditional UPDATE, so two concurrent requests cannot both
+        claim the projection. Returns False if it is busy or does not exist.
+        """
+        kwargs["status"] = status
+        invalid = set(kwargs.keys()) - self._ALLOWED_UPDATE_COLUMNS
+        if invalid:
+            raise ValueError(f"Invalid column(s): {invalid}")
+        sets = ", ".join(f"{k} = ?" for k in kwargs)
+        vals = list(kwargs.values()) + [projection_id, *BUSY_STATUSES]
+        with connection() as conn:
+            cur = conn.execute(
+                f"UPDATE projections SET {sets} WHERE id = ? AND {_NOT_BUSY}", vals
+            )
+            return cur.rowcount > 0
+
+    def fail_interrupted(self) -> int:
+        """Mark busy projections as failed; returns how many were reset.
+
+        Background tasks do not survive a restart, so at startup no task owns a
+        busy projection. Without this it would refuse every operation forever.
+        graph_id is kept, so the user can retry execute or delete-graph.
+        """
+        with connection() as conn:
+            cur = conn.execute(
+                f"UPDATE projections SET status = ?, error = ? WHERE NOT {_NOT_BUSY}",
+                (STATUS_FAILED, "Interrupted by a server restart", *BUSY_STATUSES),
+            )
+            return cur.rowcount
+
     def delete(self, projection_id: str) -> bool:
         with connection() as conn:
             cur = conn.execute("DELETE FROM projections WHERE id = ?", (projection_id,))
@@ -158,6 +202,19 @@ class ProjectionStore:
         transaction (e.g. deleting a projection and its queries atomically).
         """
         cur = conn.execute("DELETE FROM projections WHERE id = ?", (projection_id,))
+        return cur.rowcount > 0
+
+    @staticmethod
+    def delete_if_idle_on(conn, projection_id: str) -> bool:
+        """Delete a projection row only if it is not busy and has no graph.
+
+        Conditional DELETE, so a concurrent execute/delete-graph cannot slip in
+        between the check and the delete and leave an orphaned graph.
+        """
+        cur = conn.execute(
+            f"DELETE FROM projections WHERE id = ? AND graph_id IS NULL AND {_NOT_BUSY}",
+            (projection_id, *BUSY_STATUSES),
+        )
         return cur.rowcount > 0
 
     @staticmethod

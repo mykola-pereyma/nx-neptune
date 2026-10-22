@@ -38,6 +38,12 @@ from nx_neptune_proxy.services.projection_service import (
     ProjectionNotFound,
     projection_service,
 )
+from nx_neptune_proxy.services.projection_store import (
+    STATUS_ARCHIVED,
+    STATUS_DELETING,
+    STATUS_FAILED,
+    STATUS_IMPORTING,
+)
 from nx_neptune_proxy.utils import unpack_query_results
 from nx_neptune_proxy.utils.aws_helper import (
     assert_managed_graph,
@@ -224,9 +230,12 @@ async def preview_projection(projection_id: str, limit: int = Query(10, ge=1, le
 )
 def execute_projection(projection_id: str, background_tasks: BackgroundTasks):
     """Kick off the full import pipeline as a background task."""
-    p = _get_projection_or_404(projection_id)
-    if p.status == "executing":
-        raise HTTPException(status_code=409, detail="Pipeline already running")
+    _get_projection_or_404(projection_id)
+    if not projection_service.claim(projection_id, STATUS_IMPORTING):
+        raise HTTPException(
+            status_code=409, detail="An import or graph deletion is in progress"
+        )
+    p = _get_projection_or_404(projection_id)  # re-read the claimed state
     background_tasks.add_task(run_pipeline, p)
     return {"id": p.id, "status": "accepted"}
 
@@ -235,11 +244,12 @@ def execute_projection(projection_id: str, background_tasks: BackgroundTasks):
 def delete_projection(projection_id: str):
     """Permanently remove the projection record from the database."""
     p = _get_projection_or_404(projection_id)
-    if p.status == "deleting":
+    if not projection_service.delete_if_idle(projection_id):
         raise HTTPException(
-            status_code=409, detail="Graph deletion in progress, cannot purge yet"
+            status_code=409,
+            detail="Cannot purge while an operation is in progress or a graph "
+            "is attached; delete the graph first",
         )
-    projection_service.delete(projection_id)
     return {"id": p.id, "status": "deleted"}
 
 
@@ -255,20 +265,21 @@ def delete_projection_graph(projection_id: str, background_tasks: BackgroundTask
         raise HTTPException(
             status_code=409, detail="No graph associated with this projection"
         )
-    if p.status == "deleting":
-        raise HTTPException(status_code=409, detail="Already deleting")
 
     # Prefix guard: only delete graphs managed by this tool
     client = ClientFactory().neptune()
     resp = get_graph_or_exception(client, p.graph_id)
     assert_managed_graph(resp.get("name"))
 
-    projection_service.update(
+    if not projection_service.claim(
         projection_id,
-        status="deleting",
+        STATUS_DELETING,
         step="graph_delete",
         step_label="Deleting graph",
-    )
+    ):
+        raise HTTPException(
+            status_code=409, detail="An import or graph deletion is in progress"
+        )
 
     async def _delete_graph():
         client = ClientFactory().neptune()
@@ -277,7 +288,9 @@ def delete_projection_graph(projection_id: str, background_tasks: BackgroundTask
         except ClientError as e:
             if e.response["Error"]["Code"] != "ResourceNotFoundException":
                 projection_service.update(
-                    projection_id, status="failed", error=sanitize_error_message(str(e))
+                    projection_id,
+                    status=STATUS_FAILED,
+                    error=sanitize_error_message(str(e)),
                 )
                 return
         # Poll until gone
@@ -290,13 +303,13 @@ def delete_projection_graph(projection_id: str, background_tasks: BackgroundTask
         else:
             projection_service.update(
                 projection_id,
-                status="failed",
+                status=STATUS_FAILED,
                 error="Timeout waiting for graph deletion",
             )
             return
         projection_service.update(
             projection_id,
-            status="archived",
+            status=STATUS_ARCHIVED,
             graph_id=None,
             graph_endpoint=None,
             step=None,
@@ -305,7 +318,7 @@ def delete_projection_graph(projection_id: str, background_tasks: BackgroundTask
         )
 
     background_tasks.add_task(_delete_graph)
-    return {"id": p.id, "status": "deleting"}
+    return {"id": p.id, "status": STATUS_DELETING}
 
 
 @router.get(

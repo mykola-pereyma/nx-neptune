@@ -26,6 +26,7 @@ from nx_neptune_proxy.routers.projection import router as projection_router
 from nx_neptune_proxy.services.db import init_db
 from nx_neptune_proxy.services.project_deletion import delete_project
 from nx_neptune_proxy.services.project_store import store as project_store
+from nx_neptune_proxy.services.projection_store import store as projection_store
 from nx_neptune_proxy.utils.sanitize import sanitize_error_message
 
 settings = get_settings()
@@ -290,6 +291,9 @@ app.include_router(project_io_router, dependencies=[Depends(require_token)])
 
 @app.on_event("startup")
 async def resume_pending_deletions():
+    reset = projection_store.fail_interrupted()
+    if reset:
+        logger.warning(f"Marked {reset} interrupted projection(s) as failed")
     for p in project_store.list():
         if p.status == "deleting":
             logger.info(f"Resuming deletion of project {p.id} ({p.name})")
