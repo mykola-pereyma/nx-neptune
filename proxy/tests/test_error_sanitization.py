@@ -57,3 +57,24 @@ class TestErrorSanitization:
         result = sanitize_error_message(msg)
         assert "AccessDeniedException" in result
         assert "cannot perform action" in result
+
+    def test_bare_account_id_stripped(self):
+        msg = "Account 123456789012 is not subscribed to this service"
+        result = sanitize_error_message(msg)
+        assert "123456789012" not in result
+        assert result == "Account [ACCOUNT_ID] is not subscribed to this service"
+
+    def test_bare_account_id_with_punctuation_stripped(self):
+        msg = "Bucket owner (111122223333), expected '444455556666'."
+        result = sanitize_error_message(msg)
+        assert result == "Bucket owner ([ACCOUNT_ID]), expected '[ACCOUNT_ID]'."
+
+    def test_non_twelve_digit_numbers_preserved(self):
+        msg = "Request 1234567890123 failed after 12345678901 ms; id abc123456789012"
+        result = sanitize_error_message(msg)
+        assert result == msg
+
+    def test_arn_takes_precedence_over_bare_account_id(self):
+        msg = "User arn:aws:iam::123456789012:user/dev in account 123456789012"
+        result = sanitize_error_message(msg)
+        assert result == "User [ARN] in account [ACCOUNT_ID]"
