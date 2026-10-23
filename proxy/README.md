@@ -26,7 +26,26 @@ The UI is available at `http://localhost:8080`.
 
 ## Docker Compose
 
-The `docker-compose.yml` runs both the proxy and Graph Explorer locally.
+The `docker-compose.yml` runs both the proxy and Graph Explorer locally:
+
+```bash
+export AWS_DEFAULT_REGION=<your region>   # required: make up refuses to start without it
+make ui up RUNTIME=docker                 # or podman / finch (the default)
+```
+
+- The proxy UI is at `http://127.0.0.1:8080`, Graph Explorer at
+  `https://localhost:8443/explorer` (self-signed certificate). Both listen on the
+  loopback interface only. Set `GRAPH_EXPLORER_PORT` to use another port for Graph
+  Explorer; build the UI (`make ui`) with the same value so its "Open in Graph
+  Explorer" links match.
+- Projects and projections are kept in the `proxy-home` named volume and survive
+  `make up` and container recreation. `docker compose down -v` deletes them.
+- `NETWORKX_ATHENA_WORKGROUP` (optional) selects the Athena workgroup for projection
+  queries; unset uses the account's primary workgroup.
+- `GRAPH_EXPLORER_IMAGE` (optional) pins the Graph Explorer image, for example by
+  digest. The image is published for `linux/amd64` only; on Apple Silicon it runs
+  under emulation.
+- `make up` fails when compose fails.
 
 ### ⚠️ Security: AWS Credentials
 
