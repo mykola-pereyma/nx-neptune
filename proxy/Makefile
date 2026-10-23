@@ -1,9 +1,14 @@
 .PHONY: dev install test build run stop clean ui relock
 
+# bash for `set -o pipefail` in recipes (.SHELLFLAGS needs make >= 3.82; macOS ships 3.81).
+SHELL := bash
+
 RUNTIME ?= finch
 
 ui:               ## Build frontend into ui/ directory.
-	cd ui-src && npm install && npm run build
+# The UI's "Open in Graph Explorer" links are fixed at build time; match compose's port.
+	cd ui-src && npm install && \
+	VITE_GRAPH_EXPLORER_URL="$${VITE_GRAPH_EXPLORER_URL:-https://localhost:$${GRAPH_EXPLORER_PORT:-8443}/explorer}" npm run build
 
 relock:           ## Rebuild the ui-src lockfile and print a clean version diff.
 	@cd ui-src && jq -r '.packages | to_entries[] | select(.key != "") | "\(.key | sub("^node_modules/";""))@\(.value.version)"' package-lock.json 2>/dev/null | sort > /tmp/npm-before.txt || true
@@ -44,11 +49,13 @@ clean:            ## Remove container and image.
 	@$(RUNTIME) rmi nx-neptune-proxy 2>/dev/null || true
 
 up:               ## Start proxy + Graph Explorer with compose.
-	NETWORKX_PUBLIC_CONNECTIVITY=true NETWORKX_DELETION_PROTECTION=false \
-	$(RUNTIME) compose up --build --force-recreate -d 2>&1 | grep -v "nerdctl run"
+	@test -n "$$AWS_DEFAULT_REGION" || { echo "Set AWS_DEFAULT_REGION to your AWS Region first." >&2; exit 1; }
+	set -o pipefail; NETWORKX_PUBLIC_CONNECTIVITY=true NETWORKX_DELETION_PROTECTION=false \
+	$(RUNTIME) compose up --build --force-recreate -d 2>&1 | { grep -v "nerdctl run" || true; }
 
 up-ge:            ## Start only Graph Explorer.
-	$(RUNTIME) compose up graph-explorer -d 2>&1 | grep -v "nerdctl run"
+	@test -n "$$AWS_DEFAULT_REGION" || { echo "Set AWS_DEFAULT_REGION to your AWS Region first." >&2; exit 1; }
+	set -o pipefail; $(RUNTIME) compose up graph-explorer -d 2>&1 | { grep -v "nerdctl run" || true; }
 
 down:             ## Stop compose services.
 	$(RUNTIME) compose down
