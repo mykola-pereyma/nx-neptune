@@ -38,14 +38,18 @@ Keep the non-secret settings in one file and load it in every shell you use:
 cat > ~/.nx-proxy.env <<'EOF'
 export AWS_PROFILE=<the profile you sign in with>   # e.g. after `aws sso login --profile <name>`
 export REGION=<your region>                         # e.g. eu-west-1
-export AWS_DEFAULT_REGION=$REGION
+export AWS_DEFAULT_REGION=$REGION AWS_REGION=$REGION   # the CLI prefers AWS_REGION, boto3 AWS_DEFAULT_REGION
 export APP=nx-neptune                               # ApplicationId: prefix of every resource name
 export RT=docker                                    # or podman / finch
 EOF
 . ~/.nx-proxy.env
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 aws sts get-caller-identity --query Arn --output text   # your operator principal, see step 1
+$RT info >/dev/null && echo "$RT is running"
 ```
+
+If the last command fails, start the runtime first: Docker Desktop, `podman machine start`
+(macOS/Windows), or `finch vm start`.
 
 ### Cost
 
@@ -69,11 +73,11 @@ To let a non-administrator deploy, an administrator deploys a small bootstrap st
 once per account and Region:
 
 ```bash
-aws cloudformation deploy --stack-name "$APP-proxy-deployer" \
+aws cloudformation deploy --region "$REGION" --stack-name "$APP-proxy-deployer" \
   --template-file cloudformation-templates/nx-neptune-proxy-deployer.json \
   --capabilities CAPABILITY_NAMED_IAM --parameter-overrides ApplicationId="$APP"
 #   add the same GlueDatabaseName / SourceDataBucket / SourceDataPrefix / SourceDataKmsKeyArn as the proxy stack
-aws cloudformation describe-stacks --stack-name "$APP-proxy-deployer" --query 'Stacks[0].Outputs' --output table
+aws cloudformation describe-stacks --region "$REGION" --stack-name "$APP-proxy-deployer" --query 'Stacks[0].Outputs' --output table
 ```
 
 It creates:
@@ -117,12 +121,20 @@ Get the full role ARN with `aws iam get-role --role-name <RoleName> --query Role
 Unless you are an administrator, your identity also needs `sts:AssumeRole` on
 `arn:aws:iam::<account>:role/$APP-proxy-*`.
 
+**Existing graphs.** The proxy role may be able to take over any graph in the Region
+(see [Known limitations](#known-limitations)). List them first; if any must not be
+touched, choose another Region or account:
+
+```bash
+aws neptune-graph list-graphs --region "$REGION" --query 'graphs[].[name,id]' --output text
+```
+
 **Lake Formation.** Check whether it governs the Data Catalog:
 
 ```bash
-aws lakeformation get-data-lake-settings --query 'DataLakeSettings.CreateDatabaseDefaultPermissions'
+aws lakeformation get-data-lake-settings --region "$REGION" --query 'DataLakeSettings.CreateDatabaseDefaultPermissions'
 # Using your own database? Also check that one:
-aws lakeformation list-permissions --resource '{"Database":{"Name":"<db>"}}' \
+aws lakeformation list-permissions --region "$REGION" --resource '{"Database":{"Name":"<db>"}}' \
   --query 'PrincipalResourcePermissions[].Principal.DataLakePrincipalIdentifier'
 ```
 
@@ -162,7 +174,7 @@ rows and upload them with your own credentials:
 ```bash
 python3 cloudformation-templates/sample-data/generate_transactions.py --out /tmp/transactions.csv
 # {"rows": 10000, "expected_graph": {"nodes": 3981, "edges": 10000}, ...}
-aws s3 cp /tmp/transactions.csv "s3://$APP-proxy-$ACCOUNT_ID-$REGION/sample/transactions/transactions.csv"
+aws s3 cp /tmp/transactions.csv "s3://$APP-proxy-$ACCOUNT_ID-$REGION/sample/transactions/transactions.csv" --only-show-errors
 ```
 
 Like everything in the bucket, the sample expires after `StagingRetentionDays`
@@ -172,9 +184,9 @@ The data is synthetic: seeded random values in a column layout modelled on
 PaySim (E. A. Lopez-Rojas, A. Elmir, S. Axelsson, "PaySim: A financial mobile money
 simulator for fraud detection", EMSS 2016; the
 [PaySim dataset](https://www.kaggle.com/datasets/ealaxi/paysim1) is CC BY-SA 4.0).
-No PaySim data is included or downloaded. Because the layout matches, the notebook's
-`CREATE PROPERTY GRAPH` statement works on it unchanged — replace the table name with
-`transactions_sample`.
+No PaySim data is included or downloaded. Because the layout matches, the
+`CREATE PROPERTY GRAPH` statement from `notebooks/create_property_graph_pgq.ipynb` works on
+it with the table name changed (see step 3).
 
 ### 2. Get short-lived credentials for the proxy role
 
@@ -221,8 +233,52 @@ in memory, so after a page refresh reopen the launch URL. Open Graph Explorer at
 there) and accept its self-signed certificate once.
 
 In the Import page, choose the `StagingBucketUri` output as the staging bucket and,
-for the sample, the database `nx_neptune_sample`. A projection of the sample with the
-notebook's PGQ statement gives 3,981 vertices and 10,000 edges.
+for the sample, the database `nx_neptune_sample`. Use this PGQ statement for the
+sample; it gives 3,981 vertices and 10,000 edges:
+
+```sql
+CREATE PROPERTY GRAPH financial
+  VERTEX TABLES (
+    transactions_sample AS sender    KEY (nameOrig) LABEL customer NO PROPERTIES,
+    transactions_sample AS recipient KEY (nameDest) LABEL customer NO PROPERTIES
+  )
+  EDGE TABLES (
+    transactions_sample
+      SOURCE KEY (nameOrig) REFERENCES sender
+      DESTINATION KEY (nameDest) REFERENCES recipient
+      LABEL transfer PROPERTIES ALL COLUMNS
+  )
+```
+
+Then query the graph in Graph Explorer (openCypher). Customers have no properties —
+the account name is the vertex ID; transfer properties are lowercase (the Glue column
+names). Queries that return `p` draw on the canvas; the others return a table.
+
+```cypher
+// Fraudulent transfers and the accounts involved
+MATCH p = (:customer)-[t:transfer]->(:customer) WHERE t.isfraud = 1 RETURN p LIMIT 50
+
+// Recipients of fraud from more than one sender (possible mules)
+MATCH (s:customer)-[t:transfer]->(r:customer) WHERE t.isfraud = 1
+WITH r, count(DISTINCT s) AS senders WHERE senders > 1
+RETURN id(r) AS recipient, senders ORDER BY senders DESC
+
+// Two-hop neighbourhood of one account
+MATCH p = (c:customer {`~id`: 'C1000000001'})-[:transfer*1..2]-() RETURN p LIMIT 100
+
+// Largest TRANSFER transactions
+MATCH p = ()-[t:transfer]->() WHERE t.type = 'TRANSFER' AND t.amount > 150000
+RETURN p ORDER BY t.amount DESC LIMIT 25
+
+// Most active senders
+MATCH (c:customer)-[t:transfer]->()
+RETURN id(c) AS customer, count(t) AS transfers, round(sum(t.amount)) AS total
+ORDER BY transfers DESC LIMIT 10
+
+// Transfers and fraud by transaction type
+MATCH ()-[t:transfer]->()
+RETURN t.type AS type, count(*) AS transfers, sum(t.isfraud) AS fraud ORDER BY transfers DESC
+```
 
 `make up` turns graph deletion protection **off** for convenience. For anything
 longer-lived, run compose directly — after `. ~/.nx-proxy.env`, since that path skips
@@ -233,7 +289,7 @@ longer-lived, run compose directly — after `. ~/.nx-proxy.env`, since that pat
 
 ```bash
 curl -fsS http://127.0.0.1:8080/health
-aws neptune-graph list-graphs --query "graphs[].{name:name,status:status}"   # after the first Execute
+aws neptune-graph list-graphs --region "$REGION" --query "graphs[].{name:name,status:status}"   # after the first Execute
 ```
 
 ### 5. Refresh credentials (before the hour is up)
@@ -262,18 +318,18 @@ aws s3 rm "s3://$APP-proxy-$ACCOUNT_ID-$REGION/<projection-id>/" --recursive
 1. **First, while the proxy's credentials are valid** (refresh them if needed, step 5),
    delete graphs through the proxy UI (Graphs page). Once the stack is deleted its role
    is gone; leftover graphs (`nxp-*`, tag `agent=nx-neptune`) must then be deleted with
-   your own credentials: `aws neptune-graph delete-graph --graph-identifier <id> --skip-snapshot`.
+   your own credentials: `aws neptune-graph delete-graph --region "$REGION" --graph-identifier <id> --skip-snapshot`.
 2. `$RT compose -f proxy/docker-compose.yml down -v` (removes the projects volume).
 3. Delete the stack with your own credentials:
 
    ```bash
    unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN; . ~/.nx-proxy.env
    ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-   KEY_ARN=$(aws cloudformation describe-stacks --stack-name "$APP-proxy" \
+   KEY_ARN=$(aws cloudformation describe-stacks --region "$REGION" --stack-name "$APP-proxy" \
      --query "Stacks[0].Outputs[?OutputKey=='StagingKeyArn'].OutputValue" --output text)   # the key is retained; its alias is not
-   aws cloudformation update-termination-protection --no-enable-termination-protection --stack-name "$APP-proxy"
-   aws cloudformation delete-stack --stack-name "$APP-proxy"      # non-admin: add --role-arn <ExecutionRoleArn>
-   aws cloudformation wait stack-delete-complete --stack-name "$APP-proxy"
+   aws cloudformation update-termination-protection --region "$REGION" --no-enable-termination-protection --stack-name "$APP-proxy"
+   aws cloudformation delete-stack --region "$REGION" --stack-name "$APP-proxy"      # non-admin: add --role-arn <ExecutionRoleArn>
+   aws cloudformation wait stack-delete-complete --region "$REGION" --stack-name "$APP-proxy"
    ```
 4. The bucket and the key are retained. A versioned bucket must be emptied of every
    object version and delete marker before it can be deleted:
@@ -288,13 +344,13 @@ aws s3 rm "s3://$APP-proxy-$ACCOUNT_ID-$REGION/<projection-id>/" --recursive
      [ "$ERRORS" = 0 ] || { echo "delete-objects reported $ERRORS error(s); stopping" >&2; break; }
    done
    aws s3api delete-bucket --bucket "$BUCKET"
-   aws kms schedule-key-deletion --key-id "$KEY_ARN" --pending-window-in-days 7
+   aws kms schedule-key-deletion --region "$REGION" --key-id "$KEY_ARN" --pending-window-in-days 7
    ```
 5. Clean up locally: remove the `nx-proxy` profile from `~/.aws/config`, the cached
    session (`find ~/.aws/cli/cache -name '*.json' -exec grep -l "assumed-role/$APP-proxy-" {} + | xargs rm -f`)
    and `~/.nx-proxy.env`.
 6. If you deployed the bootstrap stack and no longer need it: detach `DeployerPolicyArn`
-   from its users, then `aws cloudformation delete-stack --stack-name "$APP-proxy-deployer"`.
+   from its users, then `aws cloudformation delete-stack --region "$REGION" --stack-name "$APP-proxy-deployer"`.
 
 
 ## Security properties
