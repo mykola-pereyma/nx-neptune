@@ -13,6 +13,7 @@
 import logging
 from typing import Optional, Union
 
+import boto3
 import jmespath
 from botocore.client import BaseClient
 from botocore.exceptions import ClientError
@@ -138,11 +139,24 @@ class IamClientWrapper:
                 f" Permission: [{permissions}]\n"
                 f" Resources: [{resource_arn}]\n"
             )
+            # Supply aws:RequestedRegion so region-conditioned policies evaluate as
+            # they would on the real call; the IAM client itself is global.
+            simulate_kwargs = {}
+            region = boto3.session.Session().region_name
+            if region:
+                simulate_kwargs["ContextEntries"] = [
+                    {
+                        "ContextKeyName": "aws:RequestedRegion",
+                        "ContextKeyValues": [region],
+                        "ContextKeyType": "string",
+                    }
+                ]
             # Execute the permission check
             response = self.client.simulate_principal_policy(  # type: ignore[attr-defined]
                 PolicySourceArn=self.role_arn,
                 ActionNames=permissions,
                 ResourceArns=[resource_arn],
+                **simulate_kwargs,
             )
 
             # Extract evaluation results using jmespath
