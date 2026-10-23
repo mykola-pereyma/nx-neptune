@@ -1,0 +1,1168 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "nx-neptune proxy + Graph Explorer (docker compose): least-privilege role, encrypted staging bucket, Athena workgroup, optional Lake Formation grants. Graphs are created by the proxy, not by this stack.",
+  "Metadata": {
+    "AWS::CloudFormation::Interface": {
+      "ParameterGroups": [
+        {
+          "Label": {
+            "default": "Access"
+          },
+          "Parameters": [
+            "ApplicationId",
+            "OperatorPrincipalArn",
+            "PermissionsBoundaryArn",
+            "PreflightCompatibility"
+          ]
+        },
+        {
+          "Label": {
+            "default": "Data"
+          },
+          "Parameters": [
+            "CreateSampleDataset",
+            "GlueDatabaseName",
+            "SourceDataBucket",
+            "SourceDataPrefix",
+            "SourceDataKmsKeyArn",
+            "GrantLakeFormation",
+            "StagingRetentionDays"
+          ]
+        }
+      ]
+    }
+  },
+  "Parameters": {
+    "ApplicationId": {
+      "Type": "String",
+      "Default": "nx-neptune",
+      "AllowedPattern": "[a-z][a-z0-9-]*",
+      "MinLength": 3,
+      "MaxLength": 16,
+      "Description": "Prefix for every resource name (lower case)."
+    },
+    "OperatorPrincipalArn": {
+      "Type": "String",
+      "AllowedPattern": "arn:aws[a-z-]*:iam::[0-9]{12}:(role|user)/[A-Za-z0-9+=,.@_/*-]+",
+      "MaxLength": 512,
+      "Description": "IAM role or user (in this account) allowed to assume the proxy role. Wildcards allowed, e.g. arn:aws:iam::111122223333:role/aws-reserved/sso.amazonaws.com/*AWSReservedSSO_MyPermissionSet_* for IAM Identity Center, or arn:aws:iam::111122223333:role/Admin."
+    },
+    "PermissionsBoundaryArn": {
+      "Type": "String",
+      "Default": "",
+      "AllowedPattern": "(arn:aws[a-z-]*:iam::([0-9]{12}|aws):policy/.+)?",
+      "Description": "Managed policy to set as the proxy role's permissions boundary, if your organization requires one (empty = none)."
+    },
+    "GlueDatabaseName": {
+      "Type": "String",
+      "Default": "",
+      "AllowedPattern": "[a-z0-9_]*",
+      "MaxLength": 255,
+      "Description": "Existing Glue database the proxy may read (empty = no data lake access)."
+    },
+    "SourceDataBucket": {
+      "Type": "String",
+      "Default": "",
+      "AllowedPattern": "[a-z0-9.-]*",
+      "MaxLength": 63,
+      "Description": "Bucket holding the source tables' files (empty = none). Needed unless the location is registered with Lake Formation, because Athena reads it with the role's own S3 permissions."
+    },
+    "SourceDataPrefix": {
+      "Type": "String",
+      "Default": "",
+      "AllowedPattern": "([A-Za-z0-9!_.*'()-]+/)*",
+      "MaxLength": 512,
+      "Description": "Key prefix under SourceDataBucket, ending in '/' (empty = whole bucket). Read-only."
+    },
+    "CreateSampleDataset": {
+      "Type": "String",
+      "Default": "false",
+      "AllowedValues": [
+        "true",
+        "false"
+      ],
+      "Description": "Create the Glue database nx_neptune_sample with table transactions_sample over s3://<staging bucket>/sample/transactions/. Upload the rows with sample-data/generate_transactions.py."
+    },
+    "SourceDataKmsKeyArn": {
+      "Type": "String",
+      "Default": "",
+      "AllowedPattern": "(arn:aws[a-z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/[a-f0-9-]+)?",
+      "Description": "KMS key that encrypts the source data (SSE-KMS), if any. The role may use it only through S3 (empty = none)."
+    },
+    "GrantLakeFormation": {
+      "Type": "String",
+      "Default": "false",
+      "AllowedValues": [
+        "true",
+        "false"
+      ],
+      "Description": "Grant Lake Formation DESCRIBE on the database and SELECT/DESCRIBE on its tables to the proxy role. Needs the deployer to be a Lake Formation admin."
+    },
+    "PreflightCompatibility": {
+      "Type": "String",
+      "Default": "true",
+      "AllowedValues": [
+        "true",
+        "false"
+      ],
+      "Description": "Attach the temporary policy that lets the library's IAM preflight pass (it simulates actions against Resource \"*\"). Set false once the preflight is fixed."
+    },
+    "StagingRetentionDays": {
+      "Type": "Number",
+      "Default": 7,
+      "MinValue": 1,
+      "MaxValue": 365,
+      "Description": "Days before staged CSVs and Athena results expire."
+    }
+  },
+  "Conditions": {
+    "HasBoundary": {
+      "Fn::Not": [
+        {
+          "Fn::Equals": [
+            {
+              "Ref": "PermissionsBoundaryArn"
+            },
+            ""
+          ]
+        }
+      ]
+    },
+    "HasSourceKey": {
+      "Fn::Not": [
+        {
+          "Fn::Equals": [
+            {
+              "Ref": "SourceDataKmsKeyArn"
+            },
+            ""
+          ]
+        }
+      ]
+    },
+    "HasSourceData": {
+      "Fn::Not": [
+        {
+          "Fn::Equals": [
+            {
+              "Ref": "SourceDataBucket"
+            },
+            ""
+          ]
+        }
+      ]
+    },
+    "HasDatabase": {
+      "Fn::Not": [
+        {
+          "Fn::Equals": [
+            {
+              "Ref": "GlueDatabaseName"
+            },
+            ""
+          ]
+        }
+      ]
+    },
+    "GrantLF": {
+      "Fn::And": [
+        {
+          "Condition": "HasDatabase"
+        },
+        {
+          "Fn::Equals": [
+            {
+              "Ref": "GrantLakeFormation"
+            },
+            "true"
+          ]
+        }
+      ]
+    },
+    "CreateSample": {
+      "Fn::Equals": [
+        {
+          "Ref": "CreateSampleDataset"
+        },
+        "true"
+      ]
+    },
+    "GrantSampleLF": {
+      "Fn::And": [
+        {
+          "Condition": "CreateSample"
+        },
+        {
+          "Fn::Equals": [
+            {
+              "Ref": "GrantLakeFormation"
+            },
+            "true"
+          ]
+        }
+      ]
+    },
+    "HasAnyDatabase": {
+      "Fn::Or": [
+        {
+          "Condition": "HasDatabase"
+        },
+        {
+          "Condition": "CreateSample"
+        }
+      ]
+    },
+    "AddPreflightCompat": {
+      "Fn::Equals": [
+        {
+          "Ref": "PreflightCompatibility"
+        },
+        "true"
+      ]
+    }
+  },
+  "Resources": {
+    "StagingKey": {
+      "Type": "AWS::KMS::Key",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "Description": {
+          "Fn::Sub": "${ApplicationId} proxy staging bucket and Athena results"
+        },
+        "EnableKeyRotation": true,
+        "PendingWindowInDays": 7,
+        "KeyPolicy": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "AccountAdmin",
+              "Effect": "Allow",
+              "Principal": {
+                "AWS": {
+                  "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+                }
+              },
+              "Action": "kms:*",
+              "Resource": "*"
+            }
+          ]
+        },
+        "Tags": [
+          {
+            "Key": "application",
+            "Value": {
+              "Ref": "ApplicationId"
+            }
+          },
+          {
+            "Key": "managed-by",
+            "Value": {
+              "Fn::Sub": "cloudformation:${AWS::StackName}"
+            }
+          }
+        ]
+      }
+    },
+    "StagingKeyAlias": {
+      "Type": "AWS::KMS::Alias",
+      "Properties": {
+        "AliasName": {
+          "Fn::Sub": "alias/${ApplicationId}-proxy-staging"
+        },
+        "TargetKeyId": {
+          "Ref": "StagingKey"
+        }
+      }
+    },
+    "StagingBucket": {
+      "Type": "AWS::S3::Bucket",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "BucketName": {
+          "Fn::Sub": "${ApplicationId}-proxy-${AWS::AccountId}-${AWS::Region}"
+        },
+        "VersioningConfiguration": {
+          "Status": "Enabled"
+        },
+        "BucketEncryption": {
+          "ServerSideEncryptionConfiguration": [
+            {
+              "ServerSideEncryptionByDefault": {
+                "SSEAlgorithm": "aws:kms",
+                "KMSMasterKeyID": {
+                  "Fn::GetAtt": [
+                    "StagingKey",
+                    "Arn"
+                  ]
+                }
+              },
+              "BucketKeyEnabled": true
+            }
+          ]
+        },
+        "PublicAccessBlockConfiguration": {
+          "BlockPublicAcls": true,
+          "IgnorePublicAcls": true,
+          "BlockPublicPolicy": true,
+          "RestrictPublicBuckets": true
+        },
+        "OwnershipControls": {
+          "Rules": [
+            {
+              "ObjectOwnership": "BucketOwnerEnforced"
+            }
+          ]
+        },
+        "LifecycleConfiguration": {
+          "Rules": [
+            {
+              "Id": "expire-staging",
+              "Status": "Enabled",
+              "ExpirationInDays": {
+                "Ref": "StagingRetentionDays"
+              },
+              "NoncurrentVersionExpiration": {
+                "NoncurrentDays": 1
+              },
+              "AbortIncompleteMultipartUpload": {
+                "DaysAfterInitiation": 1
+              }
+            }
+          ]
+        },
+        "Tags": [
+          {
+            "Key": "application",
+            "Value": {
+              "Ref": "ApplicationId"
+            }
+          },
+          {
+            "Key": "managed-by",
+            "Value": {
+              "Fn::Sub": "cloudformation:${AWS::StackName}"
+            }
+          }
+        ]
+      }
+    },
+    "StagingBucketPolicy": {
+      "Type": "AWS::S3::BucketPolicy",
+      "Properties": {
+        "Bucket": {
+          "Ref": "StagingBucket"
+        },
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "DenyInsecureTransport",
+              "Effect": "Deny",
+              "Principal": "*",
+              "Action": "s3:*",
+              "Resource": [
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:s3:::${StagingBucket}"
+                },
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:s3:::${StagingBucket}/*"
+                }
+              ],
+              "Condition": {
+                "Bool": {
+                  "aws:SecureTransport": "false"
+                }
+              }
+            },
+            {
+              "Sid": "DenyOldTLS",
+              "Effect": "Deny",
+              "Principal": "*",
+              "Action": "s3:*",
+              "Resource": [
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:s3:::${StagingBucket}"
+                },
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:s3:::${StagingBucket}/*"
+                }
+              ],
+              "Condition": {
+                "NumericLessThan": {
+                  "s3:TlsVersion": "1.2"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "AthenaWorkGroup": {
+      "Type": "AWS::Athena::WorkGroup",
+      "Properties": {
+        "Name": {
+          "Fn::Sub": "${ApplicationId}-proxy"
+        },
+        "State": "ENABLED",
+        "RecursiveDeleteOption": true,
+        "WorkGroupConfiguration": {
+          "EnforceWorkGroupConfiguration": false,
+          "PublishCloudWatchMetricsEnabled": true,
+          "BytesScannedCutoffPerQuery": 10737418240,
+          "ResultConfiguration": {
+            "OutputLocation": {
+              "Fn::Sub": "s3://${StagingBucket}/athena-results/"
+            },
+            "EncryptionConfiguration": {
+              "EncryptionOption": "SSE_KMS",
+              "KmsKey": {
+                "Fn::GetAtt": [
+                  "StagingKey",
+                  "Arn"
+                ]
+              }
+            }
+          }
+        },
+        "Tags": [
+          {
+            "Key": "application",
+            "Value": {
+              "Ref": "ApplicationId"
+            }
+          },
+          {
+            "Key": "managed-by",
+            "Value": {
+              "Fn::Sub": "cloudformation:${AWS::StackName}"
+            }
+          }
+        ]
+      }
+    },
+    "ProxyRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": {
+          "Fn::Sub": "${ApplicationId}-proxy-${AWS::Region}"
+        },
+        "Description": "Assumed by the nx-neptune proxy and Graph Explorer containers; also the Neptune Analytics import/export role.",
+        "MaxSessionDuration": 3600,
+        "PermissionsBoundary": {
+          "Fn::If": [
+            "HasBoundary",
+            {
+              "Ref": "PermissionsBoundaryArn"
+            },
+            {
+              "Ref": "AWS::NoValue"
+            }
+          ]
+        },
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "Operator",
+              "Effect": "Allow",
+              "Principal": {
+                "AWS": {
+                  "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+                }
+              },
+              "Action": "sts:AssumeRole",
+              "Condition": {
+                "ArnLike": {
+                  "aws:PrincipalArn": {
+                    "Ref": "OperatorPrincipalArn"
+                  }
+                }
+              }
+            },
+            {
+              "Sid": "NeptuneAnalyticsImportExport",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "neptune-graph.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole",
+              "Condition": {
+                "StringEqualsIfExists": {
+                  "aws:SourceAccount": {
+                    "Ref": "AWS::AccountId"
+                  }
+                },
+                "ArnLikeIfExists": {
+                  "aws:SourceArn": {
+                    "Fn::Sub": "arn:${AWS::Partition}:neptune-graph:${AWS::Region}:${AWS::AccountId}:*"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "proxy",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Sid": "GraphCreate",
+                  "Effect": "Allow",
+                  "Action": [
+                    "neptune-graph:CreateGraph",
+                    "neptune-graph:TagResource"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:neptune-graph:${AWS::Region}:${AWS::AccountId}:graph/*"
+                  },
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestTag/agent": "nx-neptune"
+                    }
+                  }
+                },
+                {
+                  "Sid": "GraphManageTagged",
+                  "Effect": "Allow",
+                  "Action": [
+                    "neptune-graph:GetGraph",
+                    "neptune-graph:GetGraphSummary",
+                    "neptune-graph:ResetGraph",
+                    "neptune-graph:DeleteGraph",
+                    "neptune-graph:UpdateGraph",
+                    "neptune-graph:StartGraph",
+                    "neptune-graph:StopGraph",
+                    "neptune-graph:ListTagsForResource",
+                    "neptune-graph:ReadDataViaQuery",
+                    "neptune-graph:WriteDataViaQuery",
+                    "neptune-graph:DeleteDataViaQuery",
+                    "neptune-graph:CancelQuery"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:neptune-graph:${AWS::Region}:${AWS::AccountId}:graph/*"
+                  },
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:ResourceTag/agent": "nx-neptune"
+                    }
+                  }
+                },
+                {
+                  "Sid": "GraphImportExport",
+                  "Effect": "Allow",
+                  "Action": [
+                    "neptune-graph:StartImportTask",
+                    "neptune-graph:GetImportTask",
+                    "neptune-graph:CancelImportTask",
+                    "neptune-graph:StartExportTask",
+                    "neptune-graph:GetExportTask"
+                  ],
+                  "Resource": [
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:neptune-graph:${AWS::Region}:${AWS::AccountId}:graph/*"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:neptune-graph:${AWS::Region}:${AWS::AccountId}:import-task/*"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:neptune-graph:${AWS::Region}:${AWS::AccountId}:export-task/*"
+                    }
+                  ]
+                },
+                {
+                  "Sid": "GraphList",
+                  "Effect": "Allow",
+                  "Action": [
+                    "neptune-graph:ListGraphs",
+                    "neptune-graph:ListImportTasks",
+                    "neptune-graph:ListExportTasks"
+                  ],
+                  "Resource": "*",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestedRegion": {
+                        "Ref": "AWS::Region"
+                      }
+                    }
+                  }
+                },
+                {
+                  "Sid": "SelfInspect",
+                  "Effect": "Allow",
+                  "Action": [
+                    "iam:GetRole",
+                    "iam:SimulatePrincipalPolicy"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ApplicationId}-proxy-${AWS::Region}"
+                  }
+                },
+                {
+                  "Sid": "PassSelfToNeptune",
+                  "Effect": "Allow",
+                  "Action": "iam:PassRole",
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ApplicationId}-proxy-${AWS::Region}"
+                  },
+                  "Condition": {
+                    "StringEquals": {
+                      "iam:PassedToService": "neptune-graph.amazonaws.com"
+                    }
+                  }
+                },
+                {
+                  "Sid": "StagingObjects",
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:GetObject",
+                    "s3:PutObject",
+                    "s3:PutObjectTagging",
+                    "s3:DeleteObject",
+                    "s3:AbortMultipartUpload",
+                    "s3:ListMultipartUploadParts"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:s3:::${StagingBucket}/*"
+                  }
+                },
+                {
+                  "Sid": "StagingBucket",
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:ListBucket",
+                    "s3:GetBucketLocation",
+                    "s3:GetBucketVersioning",
+                    "s3:GetEncryptionConfiguration"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:s3:::${StagingBucket}"
+                  }
+                },
+                {
+                  "Sid": "StagingKey",
+                  "Effect": "Allow",
+                  "Action": [
+                    "kms:Decrypt",
+                    "kms:GenerateDataKey",
+                    "kms:DescribeKey"
+                  ],
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "StagingKey",
+                      "Arn"
+                    ]
+                  }
+                },
+                {
+                  "Sid": "Pickers",
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:ListAllMyBuckets",
+                    "athena:ListDataCatalogs",
+                    "athena:ListWorkGroups"
+                  ],
+                  "Resource": "*"
+                },
+                {
+                  "Sid": "Athena",
+                  "Effect": "Allow",
+                  "Action": [
+                    "athena:StartQueryExecution",
+                    "athena:GetQueryExecution",
+                    "athena:GetQueryResults",
+                    "athena:StopQueryExecution",
+                    "athena:GetWorkGroup",
+                    "athena:GetDataCatalog",
+                    "athena:ListDatabases",
+                    "athena:GetDatabase",
+                    "athena:ListTableMetadata",
+                    "athena:GetTableMetadata"
+                  ],
+                  "Resource": [
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${AthenaWorkGroup}"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:datacatalog/AwsDataCatalog"
+                    }
+                  ]
+                },
+                {
+                  "Fn::If": [
+                    "HasDatabase",
+                    {
+                      "Sid": "GlueRead",
+                      "Effect": "Allow",
+                      "Action": [
+                        "glue:GetDatabase",
+                        "glue:GetDatabases",
+                        "glue:GetTable",
+                        "glue:GetTables",
+                        "glue:GetPartitions"
+                      ],
+                      "Resource": [
+                        {
+                          "Fn::Sub": "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                        },
+                        {
+                          "Fn::Sub": "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabaseName}"
+                        },
+                        {
+                          "Fn::Sub": "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabaseName}/*"
+                        }
+                      ]
+                    },
+                    {
+                      "Ref": "AWS::NoValue"
+                    }
+                  ]
+                },
+                {
+                  "Fn::If": [
+                    "CreateSample",
+                    {
+                      "Sid": "GlueReadSample",
+                      "Effect": "Allow",
+                      "Action": [
+                        "glue:GetDatabase",
+                        "glue:GetDatabases",
+                        "glue:GetTable",
+                        "glue:GetTables",
+                        "glue:GetPartitions"
+                      ],
+                      "Resource": [
+                        {
+                          "Fn::Sub": "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                        },
+                        {
+                          "Fn::Sub": "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/nx_neptune_sample"
+                        },
+                        {
+                          "Fn::Sub": "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/nx_neptune_sample/*"
+                        }
+                      ]
+                    },
+                    {
+                      "Ref": "AWS::NoValue"
+                    }
+                  ]
+                },
+                {
+                  "Fn::If": [
+                    "HasAnyDatabase",
+                    {
+                      "Sid": "LakeFormationData",
+                      "Effect": "Allow",
+                      "Action": "lakeformation:GetDataAccess",
+                      "Resource": "*"
+                    },
+                    {
+                      "Ref": "AWS::NoValue"
+                    }
+                  ]
+                },
+                {
+                  "Fn::If": [
+                    "HasSourceData",
+                    {
+                      "Sid": "SourceDataRead",
+                      "Effect": "Allow",
+                      "Action": "s3:GetObject",
+                      "Resource": {
+                        "Fn::Sub": "arn:${AWS::Partition}:s3:::${SourceDataBucket}/${SourceDataPrefix}*"
+                      }
+                    },
+                    {
+                      "Ref": "AWS::NoValue"
+                    }
+                  ]
+                },
+                {
+                  "Fn::If": [
+                    "HasSourceKey",
+                    {
+                      "Sid": "SourceDataKey",
+                      "Effect": "Allow",
+                      "Action": "kms:Decrypt",
+                      "Resource": {
+                        "Ref": "SourceDataKmsKeyArn"
+                      },
+                      "Condition": {
+                        "StringEquals": {
+                          "kms:ViaService": {
+                            "Fn::Sub": "s3.${AWS::Region}.amazonaws.com"
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "Ref": "AWS::NoValue"
+                    }
+                  ]
+                },
+                {
+                  "Fn::If": [
+                    "HasSourceData",
+                    {
+                      "Sid": "SourceDataList",
+                      "Effect": "Allow",
+                      "Action": [
+                        "s3:ListBucket",
+                        "s3:GetBucketLocation"
+                      ],
+                      "Resource": {
+                        "Fn::Sub": "arn:${AWS::Partition}:s3:::${SourceDataBucket}"
+                      },
+                      "Condition": {
+                        "StringLike": {
+                          "s3:prefix": {
+                            "Fn::Sub": "${SourceDataPrefix}*"
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "Ref": "AWS::NoValue"
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "application",
+            "Value": {
+              "Ref": "ApplicationId"
+            }
+          },
+          {
+            "Key": "managed-by",
+            "Value": {
+              "Fn::Sub": "cloudformation:${AWS::StackName}"
+            }
+          }
+        ]
+      }
+    },
+    "PreflightCompatPolicy": {
+      "Type": "AWS::IAM::RolePolicy",
+      "Condition": "AddPreflightCompat",
+      "Properties": {
+        "RoleName": {
+          "Ref": "ProxyRole"
+        },
+        "PolicyName": "preflight-compat-temporary",
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "PreflightCreateGraph",
+              "Effect": "Allow",
+              "Action": [
+                "neptune-graph:CreateGraph",
+                "neptune-graph:TagResource"
+              ],
+              "Resource": "*",
+              "Condition": {
+                "StringEquals": {
+                  "aws:RequestedRegion": {
+                    "Ref": "AWS::Region"
+                  }
+                }
+              }
+            },
+            {
+              "Sid": "PreflightAthena",
+              "Effect": "Allow",
+              "Action": [
+                "athena:StartQueryExecution",
+                "athena:GetQueryExecution"
+              ],
+              "Resource": "*",
+              "Condition": {
+                "StringEquals": {
+                  "aws:RequestedRegion": {
+                    "Ref": "AWS::Region"
+                  }
+                }
+              }
+            },
+            {
+              "Sid": "PreflightListBucketObjectArn",
+              "Effect": "Allow",
+              "Action": "s3:ListBucket",
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:s3:::${StagingBucket}/*"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "LakeFormationDatabase": {
+      "Type": "AWS::LakeFormation::PrincipalPermissions",
+      "Condition": "GrantLF",
+      "Properties": {
+        "Principal": {
+          "DataLakePrincipalIdentifier": {
+            "Fn::GetAtt": [
+              "ProxyRole",
+              "Arn"
+            ]
+          }
+        },
+        "Resource": {
+          "Database": {
+            "CatalogId": {
+              "Ref": "AWS::AccountId"
+            },
+            "Name": {
+              "Ref": "GlueDatabaseName"
+            }
+          }
+        },
+        "Permissions": [
+          "DESCRIBE"
+        ],
+        "PermissionsWithGrantOption": []
+      }
+    },
+    "LakeFormationTables": {
+      "Type": "AWS::LakeFormation::PrincipalPermissions",
+      "Condition": "GrantLF",
+      "Properties": {
+        "Principal": {
+          "DataLakePrincipalIdentifier": {
+            "Fn::GetAtt": [
+              "ProxyRole",
+              "Arn"
+            ]
+          }
+        },
+        "Resource": {
+          "Table": {
+            "CatalogId": {
+              "Ref": "AWS::AccountId"
+            },
+            "DatabaseName": {
+              "Ref": "GlueDatabaseName"
+            },
+            "TableWildcard": {}
+          }
+        },
+        "Permissions": [
+          "SELECT",
+          "DESCRIBE"
+        ],
+        "PermissionsWithGrantOption": []
+      }
+    },
+    "SampleDatabase": {
+      "Type": "AWS::Glue::Database",
+      "Condition": "CreateSample",
+      "Properties": {
+        "CatalogId": {
+          "Ref": "AWS::AccountId"
+        },
+        "DatabaseInput": {
+          "Name": "nx_neptune_sample",
+          "Description": "Synthetic transactions for nx-neptune smoke tests (no third-party data)."
+        }
+      }
+    },
+    "SampleTable": {
+      "Type": "AWS::Glue::Table",
+      "Condition": "CreateSample",
+      "Properties": {
+        "CatalogId": {
+          "Ref": "AWS::AccountId"
+        },
+        "DatabaseName": {
+          "Ref": "SampleDatabase"
+        },
+        "TableInput": {
+          "Name": "transactions_sample",
+          "TableType": "EXTERNAL_TABLE",
+          "Parameters": {
+            "classification": "csv",
+            "skip.header.line.count": "1"
+          },
+          "StorageDescriptor": {
+            "Columns": [
+              {
+                "Name": "step",
+                "Type": "int"
+              },
+              {
+                "Name": "type",
+                "Type": "string"
+              },
+              {
+                "Name": "amount",
+                "Type": "float"
+              },
+              {
+                "Name": "nameorig",
+                "Type": "string"
+              },
+              {
+                "Name": "oldbalanceorg",
+                "Type": "float"
+              },
+              {
+                "Name": "newbalanceorig",
+                "Type": "float"
+              },
+              {
+                "Name": "namedest",
+                "Type": "string"
+              },
+              {
+                "Name": "oldbalancedest",
+                "Type": "float"
+              },
+              {
+                "Name": "newbalancedest",
+                "Type": "float"
+              },
+              {
+                "Name": "isfraud",
+                "Type": "int"
+              },
+              {
+                "Name": "isflaggedfraud",
+                "Type": "int"
+              }
+            ],
+            "Location": {
+              "Fn::Sub": "s3://${StagingBucket}/sample/transactions/"
+            },
+            "InputFormat": "org.apache.hadoop.mapred.TextInputFormat",
+            "OutputFormat": "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat",
+            "SerdeInfo": {
+              "SerializationLibrary": "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe",
+              "Parameters": {
+                "field.delim": ","
+              }
+            }
+          }
+        }
+      }
+    },
+    "SampleLakeFormationDatabase": {
+      "Type": "AWS::LakeFormation::PrincipalPermissions",
+      "Condition": "GrantSampleLF",
+      "DependsOn": [
+        "SampleDatabase"
+      ],
+      "Properties": {
+        "Principal": {
+          "DataLakePrincipalIdentifier": {
+            "Fn::GetAtt": [
+              "ProxyRole",
+              "Arn"
+            ]
+          }
+        },
+        "Resource": {
+          "Database": {
+            "CatalogId": {
+              "Ref": "AWS::AccountId"
+            },
+            "Name": "nx_neptune_sample"
+          }
+        },
+        "Permissions": [
+          "DESCRIBE"
+        ],
+        "PermissionsWithGrantOption": []
+      }
+    },
+    "SampleLakeFormationTable": {
+      "Type": "AWS::LakeFormation::PrincipalPermissions",
+      "Condition": "GrantSampleLF",
+      "DependsOn": [
+        "SampleTable"
+      ],
+      "Properties": {
+        "Principal": {
+          "DataLakePrincipalIdentifier": {
+            "Fn::GetAtt": [
+              "ProxyRole",
+              "Arn"
+            ]
+          }
+        },
+        "Resource": {
+          "Table": {
+            "CatalogId": {
+              "Ref": "AWS::AccountId"
+            },
+            "DatabaseName": "nx_neptune_sample",
+            "Name": "transactions_sample"
+          }
+        },
+        "Permissions": [
+          "SELECT",
+          "DESCRIBE"
+        ],
+        "PermissionsWithGrantOption": []
+      }
+    }
+  },
+  "Outputs": {
+    "ProxyRoleArn": {
+      "Value": {
+        "Fn::GetAtt": [
+          "ProxyRole",
+          "Arn"
+        ]
+      },
+      "Description": "Assume this role for the containers (short-lived credentials)."
+    },
+    "StagingBucketUri": {
+      "Value": {
+        "Fn::Sub": "s3://${StagingBucket}"
+      },
+      "Description": "Choose this as the staging bucket in the proxy UI."
+    },
+    "AthenaWorkGroupName": {
+      "Value": {
+        "Ref": "AthenaWorkGroup"
+      },
+      "Description": "Export as NETWORKX_ATHENA_WORKGROUP."
+    },
+    "StagingKeyArn": {
+      "Value": {
+        "Fn::GetAtt": [
+          "StagingKey",
+          "Arn"
+        ]
+      }
+    },
+    "Region": {
+      "Value": {
+        "Ref": "AWS::Region"
+      },
+      "Description": "Export as AWS_DEFAULT_REGION."
+    },
+    "SampleDataUri": {
+      "Condition": "CreateSample",
+      "Value": {
+        "Fn::Sub": "s3://${StagingBucket}/sample/transactions/"
+      },
+      "Description": "Upload the generated CSV here (sample-data/generate_transactions.py)."
+    },
+    "SampleDatabaseName": {
+      "Condition": "CreateSample",
+      "Value": "nx_neptune_sample",
+      "Description": "Choose this database in the Import page."
+    }
+  }
+}

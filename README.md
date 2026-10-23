@@ -298,6 +298,13 @@ To deploy with a locally built wheel instead, pass `true` as the third argument:
 
 For full parameter reference, manual deploy steps, and environment variable details, see [cloudformation-templates/README.md](https://github.com/awslabs/nx-neptune/blob/main/cloudformation-templates/README.md).
 
+### Proxy UI + Graph Explorer
+
+To run the proxy UI (`proxy/`, `make up`) and Graph Explorer on your machine against
+your AWS account, deploy `cloudformation-templates/nx-neptune-proxy-infra.json`: a
+least-privilege role, an encrypted staging bucket, an Athena workgroup and an optional
+synthetic sample dataset. Follow [cloudformation-templates/PROXY.md](cloudformation-templates/PROXY.md).
+
 ## Jupyter Notebook Integration
 
 For interactive exploration and visualization, you can use the Jupyter notebook integration. To deploy a pre-configured SageMaker notebook environment, see [CloudFormation Deployment](#cloudformation-deployment) above.

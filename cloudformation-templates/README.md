@@ -2,6 +2,9 @@
 
 This template creates a Neptune Analytics graph and a SageMaker notebook instance with `nx_neptune` pre-installed, environment variables pre-configured, and S3 import/export support.
 
+To run the proxy UI and Graph Explorer locally against your account instead, use
+`nx-neptune-proxy-infra.json` — see [PROXY.md](PROXY.md).
+
 ## What it creates
 
 - **Neptune Analytics graph** with configurable provisioned memory
