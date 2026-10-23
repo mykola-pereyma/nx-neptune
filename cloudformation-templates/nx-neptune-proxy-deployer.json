@@ -1,0 +1,953 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "One-time, administrator-deployed prerequisites so non-administrators can deploy nx-neptune-proxy-infra: a CloudFormation execution role, the permissions boundary it must put on the proxy role, and a managed policy for deployers.",
+  "Parameters": {
+    "ApplicationId": {
+      "Type": "String",
+      "Default": "nx-neptune",
+      "AllowedPattern": "[a-z][a-z0-9-]*",
+      "MinLength": 3,
+      "MaxLength": 16,
+      "Description": "Same ApplicationId you will use for the proxy stack."
+    },
+    "GlueDatabaseName": {
+      "Type": "String",
+      "Default": "",
+      "AllowedPattern": "[a-z0-9_]*",
+      "MaxLength": 255,
+      "Description": "Existing Glue database the proxy may read (empty = no data lake access). Must match the proxy stack's value; the boundary admits nothing else."
+    },
+    "SourceDataBucket": {
+      "Type": "String",
+      "Default": "",
+      "AllowedPattern": "[a-z0-9.-]*",
+      "MaxLength": 63,
+      "Description": "Bucket holding the source tables' files (empty = none). Needed unless the location is registered with Lake Formation, because Athena reads it with the role's own S3 permissions. Must match the proxy stack's value; the boundary admits nothing else."
+    },
+    "SourceDataPrefix": {
+      "Type": "String",
+      "Default": "",
+      "AllowedPattern": "([A-Za-z0-9!_.*'()-]+/)*",
+      "MaxLength": 512,
+      "Description": "Key prefix under SourceDataBucket, ending in '/' (empty = whole bucket). Read-only. Must match the proxy stack's value; the boundary admits nothing else."
+    },
+    "SourceDataKmsKeyArn": {
+      "Type": "String",
+      "Default": "",
+      "AllowedPattern": "(arn:aws[a-z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/[a-f0-9-]+)?",
+      "Description": "KMS key that encrypts the source data (SSE-KMS), if any. The role may use it only through S3 (empty = none). Must match the proxy stack's value; the boundary admits nothing else."
+    }
+  },
+  "Conditions": {
+    "HasDatabase": {
+      "Fn::Not": [
+        {
+          "Fn::Equals": [
+            {
+              "Ref": "GlueDatabaseName"
+            },
+            ""
+          ]
+        }
+      ]
+    },
+    "HasSourceData": {
+      "Fn::Not": [
+        {
+          "Fn::Equals": [
+            {
+              "Ref": "SourceDataBucket"
+            },
+            ""
+          ]
+        }
+      ]
+    },
+    "HasSourceKey": {
+      "Fn::Not": [
+        {
+          "Fn::Equals": [
+            {
+              "Ref": "SourceDataKmsKeyArn"
+            },
+            ""
+          ]
+        }
+      ]
+    }
+  },
+  "Resources": {
+    "ProxyBoundary": {
+      "Type": "AWS::IAM::ManagedPolicy",
+      "Properties": {
+        "ManagedPolicyName": {
+          "Fn::Sub": "${ApplicationId}-proxy-boundary"
+        },
+        "Description": "Permissions boundary for the nx-neptune proxy role.",
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "GraphCreate",
+              "Effect": "Allow",
+              "Action": [
+                "neptune-graph:CreateGraph",
+                "neptune-graph:TagResource"
+              ],
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:neptune-graph:${AWS::Region}:${AWS::AccountId}:graph/*"
+              },
+              "Condition": {
+                "StringEquals": {
+                  "aws:RequestTag/agent": "nx-neptune"
+                }
+              }
+            },
+            {
+              "Sid": "GraphManageTagged",
+              "Effect": "Allow",
+              "Action": [
+                "neptune-graph:GetGraph",
+                "neptune-graph:GetGraphSummary",
+                "neptune-graph:ResetGraph",
+                "neptune-graph:DeleteGraph",
+                "neptune-graph:UpdateGraph",
+                "neptune-graph:StartGraph",
+                "neptune-graph:StopGraph",
+                "neptune-graph:ListTagsForResource",
+                "neptune-graph:ReadDataViaQuery",
+                "neptune-graph:WriteDataViaQuery",
+                "neptune-graph:DeleteDataViaQuery",
+                "neptune-graph:CancelQuery"
+              ],
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:neptune-graph:${AWS::Region}:${AWS::AccountId}:graph/*"
+              },
+              "Condition": {
+                "StringEquals": {
+                  "aws:ResourceTag/agent": "nx-neptune"
+                }
+              }
+            },
+            {
+              "Sid": "GraphImportExport",
+              "Effect": "Allow",
+              "Action": [
+                "neptune-graph:StartImportTask",
+                "neptune-graph:GetImportTask",
+                "neptune-graph:CancelImportTask",
+                "neptune-graph:StartExportTask",
+                "neptune-graph:GetExportTask"
+              ],
+              "Resource": [
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:neptune-graph:${AWS::Region}:${AWS::AccountId}:graph/*"
+                },
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:neptune-graph:${AWS::Region}:${AWS::AccountId}:import-task/*"
+                },
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:neptune-graph:${AWS::Region}:${AWS::AccountId}:export-task/*"
+                }
+              ]
+            },
+            {
+              "Sid": "GraphList",
+              "Effect": "Allow",
+              "Action": [
+                "neptune-graph:ListGraphs",
+                "neptune-graph:ListImportTasks",
+                "neptune-graph:ListExportTasks"
+              ],
+              "Resource": "*",
+              "Condition": {
+                "StringEquals": {
+                  "aws:RequestedRegion": {
+                    "Ref": "AWS::Region"
+                  }
+                }
+              }
+            },
+            {
+              "Sid": "SelfInspect",
+              "Effect": "Allow",
+              "Action": [
+                "iam:GetRole",
+                "iam:SimulatePrincipalPolicy"
+              ],
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ApplicationId}-proxy-${AWS::Region}"
+              }
+            },
+            {
+              "Sid": "PassSelfToNeptune",
+              "Effect": "Allow",
+              "Action": "iam:PassRole",
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ApplicationId}-proxy-${AWS::Region}"
+              },
+              "Condition": {
+                "StringEquals": {
+                  "iam:PassedToService": "neptune-graph.amazonaws.com"
+                }
+              }
+            },
+            {
+              "Sid": "StagingObjects",
+              "Effect": "Allow",
+              "Action": [
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:PutObjectTagging",
+                "s3:DeleteObject",
+                "s3:AbortMultipartUpload",
+                "s3:ListMultipartUploadParts"
+              ],
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:s3:::${ApplicationId}-proxy-${AWS::AccountId}-${AWS::Region}/*"
+              }
+            },
+            {
+              "Sid": "StagingBucket",
+              "Effect": "Allow",
+              "Action": [
+                "s3:ListBucket",
+                "s3:GetBucketLocation",
+                "s3:GetBucketVersioning",
+                "s3:GetEncryptionConfiguration"
+              ],
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:s3:::${ApplicationId}-proxy-${AWS::AccountId}-${AWS::Region}"
+              }
+            },
+            {
+              "Sid": "StagingKey",
+              "Effect": "Allow",
+              "Action": [
+                "kms:Decrypt",
+                "kms:GenerateDataKey",
+                "kms:DescribeKey"
+              ],
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*"
+              },
+              "Condition": {
+                "StringEquals": {
+                  "aws:ResourceTag/application": {
+                    "Ref": "ApplicationId"
+                  }
+                }
+              }
+            },
+            {
+              "Sid": "Pickers",
+              "Effect": "Allow",
+              "Action": [
+                "s3:ListAllMyBuckets",
+                "athena:ListDataCatalogs",
+                "athena:ListWorkGroups"
+              ],
+              "Resource": "*"
+            },
+            {
+              "Sid": "Athena",
+              "Effect": "Allow",
+              "Action": [
+                "athena:StartQueryExecution",
+                "athena:GetQueryExecution",
+                "athena:GetQueryResults",
+                "athena:StopQueryExecution",
+                "athena:GetWorkGroup",
+                "athena:GetDataCatalog",
+                "athena:ListDatabases",
+                "athena:GetDatabase",
+                "athena:ListTableMetadata",
+                "athena:GetTableMetadata"
+              ],
+              "Resource": [
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${ApplicationId}-proxy"
+                },
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:datacatalog/AwsDataCatalog"
+                }
+              ]
+            },
+            {
+              "Fn::If": [
+                "HasDatabase",
+                {
+                  "Sid": "GlueRead",
+                  "Effect": "Allow",
+                  "Action": [
+                    "glue:GetDatabase",
+                    "glue:GetDatabases",
+                    "glue:GetTable",
+                    "glue:GetTables",
+                    "glue:GetPartitions"
+                  ],
+                  "Resource": [
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabaseName}"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabaseName}/*"
+                    }
+                  ]
+                },
+                {
+                  "Ref": "AWS::NoValue"
+                }
+              ]
+            },
+            {
+              "Sid": "GlueReadSample",
+              "Effect": "Allow",
+              "Action": [
+                "glue:GetDatabase",
+                "glue:GetDatabases",
+                "glue:GetTable",
+                "glue:GetTables",
+                "glue:GetPartitions"
+              ],
+              "Resource": [
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                },
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/nx_neptune_sample"
+                },
+                {
+                  "Fn::Sub": "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/nx_neptune_sample/*"
+                }
+              ]
+            },
+            {
+              "Sid": "LakeFormationData",
+              "Effect": "Allow",
+              "Action": "lakeformation:GetDataAccess",
+              "Resource": "*"
+            },
+            {
+              "Fn::If": [
+                "HasSourceData",
+                {
+                  "Sid": "SourceDataRead",
+                  "Effect": "Allow",
+                  "Action": "s3:GetObject",
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:s3:::${SourceDataBucket}/${SourceDataPrefix}*"
+                  }
+                },
+                {
+                  "Ref": "AWS::NoValue"
+                }
+              ]
+            },
+            {
+              "Fn::If": [
+                "HasSourceKey",
+                {
+                  "Sid": "SourceDataKey",
+                  "Effect": "Allow",
+                  "Action": "kms:Decrypt",
+                  "Resource": {
+                    "Ref": "SourceDataKmsKeyArn"
+                  },
+                  "Condition": {
+                    "StringEquals": {
+                      "kms:ViaService": {
+                        "Fn::Sub": "s3.${AWS::Region}.amazonaws.com"
+                      }
+                    }
+                  }
+                },
+                {
+                  "Ref": "AWS::NoValue"
+                }
+              ]
+            },
+            {
+              "Fn::If": [
+                "HasSourceData",
+                {
+                  "Sid": "SourceDataList",
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:ListBucket",
+                    "s3:GetBucketLocation"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:s3:::${SourceDataBucket}"
+                  },
+                  "Condition": {
+                    "StringLike": {
+                      "s3:prefix": {
+                        "Fn::Sub": "${SourceDataPrefix}*"
+                      }
+                    }
+                  }
+                },
+                {
+                  "Ref": "AWS::NoValue"
+                }
+              ]
+            },
+            {
+              "Sid": "PreflightCreateGraph",
+              "Effect": "Allow",
+              "Action": [
+                "neptune-graph:CreateGraph",
+                "neptune-graph:TagResource"
+              ],
+              "Resource": "*",
+              "Condition": {
+                "StringEquals": {
+                  "aws:RequestedRegion": {
+                    "Ref": "AWS::Region"
+                  }
+                }
+              }
+            },
+            {
+              "Sid": "PreflightAthena",
+              "Effect": "Allow",
+              "Action": [
+                "athena:StartQueryExecution",
+                "athena:GetQueryExecution"
+              ],
+              "Resource": "*",
+              "Condition": {
+                "StringEquals": {
+                  "aws:RequestedRegion": {
+                    "Ref": "AWS::Region"
+                  }
+                }
+              }
+            },
+            {
+              "Sid": "PreflightListBucketObjectArn",
+              "Effect": "Allow",
+              "Action": "s3:ListBucket",
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:s3:::${ApplicationId}-proxy-${AWS::AccountId}-${AWS::Region}/*"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "ExecutionRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "RoleName": {
+          "Fn::Sub": "${ApplicationId}-cfn-exec"
+        },
+        "Description": "CloudFormation execution role for the nx-neptune proxy stack.",
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "cloudformation.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "deploy-proxy-stack",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Sid": "ProxyRoleCreateWithBoundary",
+                  "Effect": "Allow",
+                  "Action": [
+                    "iam:CreateRole",
+                    "iam:PutRolePolicy",
+                    "iam:DeleteRolePolicy",
+                    "iam:PutRolePermissionsBoundary"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ApplicationId}-proxy-*"
+                  },
+                  "Condition": {
+                    "StringEquals": {
+                      "iam:PermissionsBoundary": {
+                        "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/${ApplicationId}-proxy-boundary"
+                      }
+                    }
+                  }
+                },
+                {
+                  "Sid": "ProxyRoleManage",
+                  "Effect": "Allow",
+                  "Action": [
+                    "iam:GetRole",
+                    "iam:GetRolePolicy",
+                    "iam:DeleteRole",
+                    "iam:UpdateRole",
+                    "iam:UpdateAssumeRolePolicy",
+                    "iam:ListRolePolicies",
+                    "iam:ListAttachedRolePolicies",
+                    "iam:ListRoleTags",
+                    "iam:TagRole",
+                    "iam:UntagRole",
+                    "iam:UpdateRoleDescription"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ApplicationId}-proxy-*"
+                  }
+                },
+                {
+                  "Sid": "KeyCreate",
+                  "Effect": "Allow",
+                  "Action": [
+                    "kms:CreateKey",
+                    "kms:TagResource"
+                  ],
+                  "Resource": "*",
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:RequestTag/application": {
+                        "Ref": "ApplicationId"
+                      }
+                    }
+                  }
+                },
+                {
+                  "Sid": "KeyManage",
+                  "Effect": "Allow",
+                  "Action": [
+                    "kms:DescribeKey",
+                    "kms:GetKeyPolicy",
+                    "kms:PutKeyPolicy",
+                    "kms:EnableKeyRotation",
+                    "kms:GetKeyRotationStatus",
+                    "kms:ListResourceTags",
+                    "kms:UntagResource",
+                    "kms:UpdateKeyDescription",
+                    "kms:ScheduleKeyDeletion"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*"
+                  },
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:ResourceTag/application": {
+                        "Ref": "ApplicationId"
+                      }
+                    }
+                  }
+                },
+                {
+                  "Sid": "KeyAliasName",
+                  "Effect": "Allow",
+                  "Action": [
+                    "kms:CreateAlias",
+                    "kms:DeleteAlias",
+                    "kms:UpdateAlias"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:alias/${ApplicationId}-proxy-*"
+                  }
+                },
+                {
+                  "Sid": "KeyAliasTarget",
+                  "Effect": "Allow",
+                  "Action": [
+                    "kms:CreateAlias",
+                    "kms:DeleteAlias",
+                    "kms:UpdateAlias"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*"
+                  },
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:ResourceTag/application": {
+                        "Ref": "ApplicationId"
+                      }
+                    }
+                  }
+                },
+                {
+                  "Sid": "KeyList",
+                  "Effect": "Allow",
+                  "Action": "kms:ListAliases",
+                  "Resource": "*"
+                },
+                {
+                  "Sid": "Bucket",
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:CreateBucket",
+                    "s3:ListBucket",
+                    "s3:GetBucketLocation",
+                    "s3:PutBucketVersioning",
+                    "s3:GetBucketVersioning",
+                    "s3:PutEncryptionConfiguration",
+                    "s3:GetEncryptionConfiguration",
+                    "s3:PutLifecycleConfiguration",
+                    "s3:GetLifecycleConfiguration",
+                    "s3:PutBucketPublicAccessBlock",
+                    "s3:GetBucketPublicAccessBlock",
+                    "s3:PutBucketOwnershipControls",
+                    "s3:GetBucketOwnershipControls",
+                    "s3:PutBucketPolicy",
+                    "s3:GetBucketPolicy",
+                    "s3:DeleteBucketPolicy",
+                    "s3:PutBucketTagging",
+                    "s3:GetBucketTagging"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:s3:::${ApplicationId}-proxy-${AWS::AccountId}-${AWS::Region}"
+                  }
+                },
+                {
+                  "Sid": "WorkGroup",
+                  "Effect": "Allow",
+                  "Action": [
+                    "athena:CreateWorkGroup",
+                    "athena:DeleteWorkGroup",
+                    "athena:GetWorkGroup",
+                    "athena:UpdateWorkGroup",
+                    "athena:TagResource",
+                    "athena:UntagResource",
+                    "athena:ListTagsForResource"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${ApplicationId}-proxy"
+                  }
+                },
+                {
+                  "Sid": "SampleCatalogWrite",
+                  "Effect": "Allow",
+                  "Action": [
+                    "glue:CreateDatabase",
+                    "glue:DeleteDatabase",
+                    "glue:UpdateDatabase",
+                    "glue:CreateTable",
+                    "glue:DeleteTable",
+                    "glue:UpdateTable"
+                  ],
+                  "Resource": [
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/nx_neptune_sample"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/nx_neptune_sample/*"
+                    }
+                  ]
+                },
+                {
+                  "Sid": "CatalogRead",
+                  "Effect": "Allow",
+                  "Action": [
+                    "glue:GetDatabase",
+                    "glue:GetDatabases",
+                    "glue:GetTable",
+                    "glue:GetTables"
+                  ],
+                  "Resource": [
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/*"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/*/*"
+                    }
+                  ]
+                },
+                {
+                  "Sid": "LakeFormationGrants",
+                  "Effect": "Allow",
+                  "Action": [
+                    "lakeformation:GrantPermissions",
+                    "lakeformation:RevokePermissions",
+                    "lakeformation:ListPermissions"
+                  ],
+                  "Resource": "*"
+                }
+              ]
+            }
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "application",
+            "Value": {
+              "Ref": "ApplicationId"
+            }
+          }
+        ]
+      }
+    },
+    "DeployerPolicy": {
+      "Type": "AWS::IAM::ManagedPolicy",
+      "Properties": {
+        "ManagedPolicyName": {
+          "Fn::Sub": "${ApplicationId}-proxy-deployer"
+        },
+        "Description": "Attach to people who deploy the nx-neptune proxy stack (through the execution role only).",
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "StackViaExecutionRole",
+              "Effect": "Allow",
+              "Action": [
+                "cloudformation:CreateStack",
+                "cloudformation:UpdateStack",
+                "cloudformation:CreateChangeSet"
+              ],
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ApplicationId}-proxy/*"
+              },
+              "Condition": {
+                "StringEquals": {
+                  "cloudformation:RoleArn": {
+                    "Fn::GetAtt": [
+                      "ExecutionRole",
+                      "Arn"
+                    ]
+                  }
+                },
+                "ForAllValues:StringEquals": {
+                  "cloudformation:ResourceTypes": [
+                    "AWS::Athena::WorkGroup",
+                    "AWS::Glue::Database",
+                    "AWS::Glue::Table",
+                    "AWS::IAM::Role",
+                    "AWS::IAM::RolePolicy",
+                    "AWS::KMS::Alias",
+                    "AWS::KMS::Key",
+                    "AWS::LakeFormation::PrincipalPermissions",
+                    "AWS::S3::Bucket",
+                    "AWS::S3::BucketPolicy"
+                  ]
+                }
+              }
+            },
+            {
+              "Sid": "DeleteViaExecutionRole",
+              "Effect": "Allow",
+              "Action": "cloudformation:DeleteStack",
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ApplicationId}-proxy/*"
+              },
+              "Condition": {
+                "StringEquals": {
+                  "cloudformation:RoleArn": {
+                    "Fn::GetAtt": [
+                      "ExecutionRole",
+                      "Arn"
+                    ]
+                  }
+                }
+              }
+            },
+            {
+              "Sid": "NoImports",
+              "Effect": "Deny",
+              "Action": "cloudformation:CreateChangeSet",
+              "Resource": "*",
+              "Condition": {
+                "Null": {
+                  "cloudformation:ImportResourceTypes": "false"
+                }
+              }
+            },
+            {
+              "Sid": "StackRead",
+              "Effect": "Allow",
+              "Action": [
+                "cloudformation:DescribeStacks",
+                "cloudformation:DescribeStackEvents",
+                "cloudformation:DescribeStackResources",
+                "cloudformation:ListStackResources",
+                "cloudformation:GetTemplate",
+                "cloudformation:DescribeChangeSet",
+                "cloudformation:ExecuteChangeSet",
+                "cloudformation:DeleteChangeSet",
+                "cloudformation:UpdateTerminationProtection"
+              ],
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ApplicationId}-proxy/*"
+              }
+            },
+            {
+              "Sid": "TemplateChecks",
+              "Effect": "Allow",
+              "Action": [
+                "cloudformation:ValidateTemplate",
+                "cloudformation:GetTemplateSummary"
+              ],
+              "Resource": "*"
+            },
+            {
+              "Sid": "PassExecutionRole",
+              "Effect": "Allow",
+              "Action": "iam:PassRole",
+              "Resource": {
+                "Fn::GetAtt": [
+                  "ExecutionRole",
+                  "Arn"
+                ]
+              },
+              "Condition": {
+                "StringEquals": {
+                  "iam:PassedToService": "cloudformation.amazonaws.com"
+                }
+              }
+            },
+            {
+              "Sid": "SampleUpload",
+              "Effect": "Allow",
+              "Action": "s3:PutObject",
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:s3:::${ApplicationId}-proxy-${AWS::AccountId}-${AWS::Region}/sample/*"
+              }
+            },
+            {
+              "Sid": "UploadKey",
+              "Effect": "Allow",
+              "Action": [
+                "kms:GenerateDataKey",
+                "kms:Decrypt"
+              ],
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*"
+              },
+              "Condition": {
+                "StringEquals": {
+                  "aws:ResourceTag/application": {
+                    "Ref": "ApplicationId"
+                  },
+                  "kms:ViaService": {
+                    "Fn::Sub": "s3.${AWS::Region}.amazonaws.com"
+                  }
+                }
+              }
+            },
+            {
+              "Sid": "TeardownBucket",
+              "Effect": "Allow",
+              "Action": [
+                "s3:ListBucket",
+                "s3:ListBucketVersions",
+                "s3:DeleteBucket"
+              ],
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:s3:::${ApplicationId}-proxy-${AWS::AccountId}-${AWS::Region}"
+              }
+            },
+            {
+              "Sid": "TeardownObjects",
+              "Effect": "Allow",
+              "Action": [
+                "s3:DeleteObject",
+                "s3:DeleteObjectVersion"
+              ],
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:s3:::${ApplicationId}-proxy-${AWS::AccountId}-${AWS::Region}/*"
+              }
+            },
+            {
+              "Sid": "TeardownKey",
+              "Effect": "Allow",
+              "Action": [
+                "kms:DescribeKey",
+                "kms:ScheduleKeyDeletion"
+              ],
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*"
+              },
+              "Condition": {
+                "StringEquals": {
+                  "aws:ResourceTag/application": {
+                    "Ref": "ApplicationId"
+                  }
+                }
+              }
+            },
+            {
+              "Sid": "TeardownGraphsList",
+              "Effect": "Allow",
+              "Action": "neptune-graph:ListGraphs",
+              "Resource": "*",
+              "Condition": {
+                "StringEquals": {
+                  "aws:RequestedRegion": {
+                    "Ref": "AWS::Region"
+                  }
+                }
+              }
+            },
+            {
+              "Sid": "TeardownGraphs",
+              "Effect": "Allow",
+              "Action": [
+                "neptune-graph:GetGraph",
+                "neptune-graph:UpdateGraph",
+                "neptune-graph:DeleteGraph",
+                "neptune-graph:ListTagsForResource"
+              ],
+              "Resource": {
+                "Fn::Sub": "arn:${AWS::Partition}:neptune-graph:${AWS::Region}:${AWS::AccountId}:graph/*"
+              },
+              "Condition": {
+                "StringEquals": {
+                  "aws:ResourceTag/agent": "nx-neptune"
+                }
+              }
+            },
+            {
+              "Sid": "Checks",
+              "Effect": "Allow",
+              "Action": [
+                "lakeformation:GetDataLakeSettings",
+                "lakeformation:ListPermissions"
+              ],
+              "Resource": "*"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "Outputs": {
+    "ExecutionRoleArn": {
+      "Value": {
+        "Fn::GetAtt": [
+          "ExecutionRole",
+          "Arn"
+        ]
+      },
+      "Description": "Pass as --role-arn when deploying the proxy stack."
+    },
+    "ProxyBoundaryArn": {
+      "Value": {
+        "Ref": "ProxyBoundary"
+      },
+      "Description": "Pass as PermissionsBoundaryArn to the proxy stack."
+    },
+    "DeployerPolicyArn": {
+      "Value": {
+        "Ref": "DeployerPolicy"
+      },
+      "Description": "Attach to the deployer (IAM role/user, or a permission set as a customer managed policy)."
+    }
+  }
+}
